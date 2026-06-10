@@ -17,6 +17,7 @@ if [ "${ENABLE_VNC:-false}" = "true" ]; then
     websockify --web /opt/noVNC 6080 localhost:5900 &
 fi
 
-# Run the daemon (migrate + onboard + task queue).
-# Forward any arguments, e.g. --onboard <file>.
-exec python manage.py rundaemon "$@"
+# Migrate, then run the browser worker (sequences, reply polling, lead search).
+# The web process (runserver) is launched as its own container.
+python manage.py migrate --no-input
+exec python manage.py run_worker "$@"

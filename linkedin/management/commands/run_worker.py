@@ -37,7 +37,13 @@ class Command(BaseCommand):
         # Heavy, less-urgent work (reply backfill scrapes, lead enrichment,
         # scoring) runs on its own slower clock so it can't starve the sender.
         HEAVY_EVERY = 600  # seconds
+        # Never re-attempt a fresh login more than once per this window — a real
+        # LinkedIn account must not be hammered with logins (lockout/flag risk),
+        # especially when it has no stored TOTP and a human is needed to clear a
+        # checkpoint. Between attempts the worker just idles.
+        REAUTH_COOLDOWN = 1800  # seconds
         last_heavy = 0.0
+        last_reauth = -REAUTH_COOLDOWN
         consecutive_errors = 0
         while True:
             from django.db import connection
@@ -71,17 +77,28 @@ class Command(BaseCommand):
                 )
             except AuthenticationError as exc:
                 # The LinkedIn session is no longer valid (cookie revoked, password
-                # changed, etc). Try to recover by logging in fresh (TOTP-aware)
-                # instead of silently failing every cycle forever.
+                # changed, etc). Try to recover by logging in fresh (TOTP-aware) —
+                # but at most once per REAUTH_COOLDOWN so we never hammer logins on
+                # a real account. Between attempts we just idle and log.
                 consecutive_errors += 1
-                self.stderr.write(f"auth error — re-authenticating: {exc!r}")
-                logger.warning("Worker auth error; attempting reauthenticate()", exc_info=True)
-                try:
-                    session.reauthenticate()
-                    self.stdout.write(self.style.SUCCESS("re-authenticated OK"))
-                    consecutive_errors = 0
-                except Exception:
-                    logger.error("Re-authentication failed:\n%s", traceback.format_exc())
+                now_m = time.monotonic()
+                if now_m - last_reauth < REAUTH_COOLDOWN:
+                    self.stderr.write(f"auth error (cooling down, no reauth): {exc!r}")
+                    logger.warning("Worker auth error; in reauth cooldown — idling")
+                else:
+                    last_reauth = now_m
+                    self.stderr.write(f"auth error — re-authenticating: {exc!r}")
+                    logger.warning("Worker auth error; attempting reauthenticate()", exc_info=True)
+                    try:
+                        session.reauthenticate()
+                        self.stdout.write(self.style.SUCCESS("re-authenticated OK"))
+                        consecutive_errors = 0
+                    except Exception:
+                        logger.error(
+                            "Re-authentication failed — the account likely needs a human "
+                            "to clear a checkpoint (open the VNC) or a TOTP secret set in "
+                            "the dashboard Accounts tab:\n%s", traceback.format_exc(),
+                        )
             except Exception as exc:  # keep the worker alive across transient errors
                 consecutive_errors += 1
                 # Log the FULL traceback (the old 200-char repr hid the cause) so a

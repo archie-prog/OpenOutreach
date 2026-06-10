@@ -13,8 +13,8 @@ setup: install ## install deps + Playwright browsers + migrate + bootstrap CRM
 	python manage.py migrate --no-input
 	python manage.py setup_crm
 
-run: ## run the daemon
-	python manage.py rundaemon
+run: ## run the browser worker (sequences, replies, lead search)
+	python manage.py run_worker
 
 test: ## run the test suite
 	.venv/bin/pytest
