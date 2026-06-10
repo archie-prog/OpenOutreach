@@ -67,40 +67,80 @@ def fetch_thread_messages(session, lead) -> list[dict]:
     return out
 
 
+# A queued manual reply that keeps failing must not re-drive a live browser send
+# every worker cycle forever — give up after this many attempts and surface it.
+MAX_MANUAL_SEND_ATTEMPTS = 3
+
+
 def process_pending_sends(session) -> int:
-    """Send any manual replies queued from the Unibox. Sends from the thread's
-    owning account (single-account today = the worker's session). Returns count.
+    """Send any manual replies queued from the Unibox, from the thread's owning
+    account. Manual sends are user-initiated, so they're sent immediately (not
+    window-gated) but are *recorded* (ActionLog + daily counter) so they show up
+    in the activity feed/KPIs and count toward the account's limits. Retries are
+    bounded; a permanently-failing send is marked failed, not retried forever.
+    Returns the number sent this cycle.
     """
     from django.utils import timezone
 
-    from linkedin.models import Message
+    from linkedin.accounts.limits import record_action
+    from linkedin.models import ActionLog, Message
     from linkedin_cli.actions.message import send_raw_message
 
     sent = 0
     pending = Message.objects.filter(pending_send=True).select_related("thread__lead", "thread__account")
     for m in pending:
         lead = m.thread.lead
+        account = m.sender_account or m.thread.account
         urn = lead.urn
         if not urn:
             try:
                 urn = lead.get_urn(session)
             except Exception:
                 urn = ""
+        m.send_attempts = (m.send_attempts or 0) + 1
+        ok = False
+        err = ""
         try:
-            ok = send_raw_message(
+            ok = bool(send_raw_message(
                 session,
                 {"public_identifier": lead.public_identifier, "url": lead.linkedin_url, "urn": urn or ""},
                 m.body,
-            )
-        except Exception:
+            ))
+        except Exception as exc:
+            err = repr(exc)[:300]
             logger.exception("Manual send failed for message %s", m.pk)
-            continue
+
         if ok:
             m.pending_send = False
             m.sent_at = timezone.now()
-            m.save(update_fields=["pending_send", "sent_at"])
+            m.send_error = ""
+            m.save(update_fields=["pending_send", "sent_at", "send_attempts", "send_error"])
+            # Record so the send appears in the activity feed/KPIs and counts
+            # toward the daily message cap (the executor's automated sends do the
+            # same via _log). A campaign is needed for ActionLog; use the lead's
+            # most recent campaign state if any.
+            campaign = _lead_campaign(lead)
+            if campaign is not None:
+                ActionLog.objects.create(
+                    linkedin_profile=account, campaign=campaign, lead=lead,
+                    action_type=ActionLog.ActionType.MESSAGE,
+                )
+            record_action(account, "message")
             sent += 1
+        else:
+            m.send_error = err or "send returned no confirmation"
+            if m.send_attempts >= MAX_MANUAL_SEND_ATTEMPTS:
+                m.pending_send = False  # give up — UI shows it as failed
+                logger.warning("Manual send %s gave up after %d attempts", m.pk, m.send_attempts)
+            m.save(update_fields=["pending_send", "send_attempts", "send_error"])
     return sent
+
+
+def _lead_campaign(lead):
+    """The campaign to attribute a manual send to — the lead's most recent
+    campaign state, if any (manual replies aren't tied to a single campaign)."""
+    state = lead.campaign_states.order_by("-created_at").select_related("campaign").first()
+    return state.campaign if state else None
 
 
 def poll_replies(session, campaign=None, limit=None) -> int:
@@ -122,9 +162,17 @@ def poll_replies(session, campaign=None, limit=None) -> int:
         qs = qs.filter(campaign=campaign)
     qs = qs.select_related("lead", "campaign")
     if limit:
-        # Most-recently-actioned first — the leads most likely to have a fresh
-        # reply — then bound the scan so the cycle doesn't stall on a big list.
-        qs = qs.order_by("-last_action_at")[:limit]
+        # Rotate coverage by least-recently-polled so EVERY pollable lead is
+        # eventually scanned — not just the top-N by recent activity (which would
+        # never re-poll completed/stopped leads, whose last_action_at is frozen,
+        # so a reply arriving after a sequence finished would never sync). We sort
+        # by the lead's thread last_polled_at, nulls (never polled) first.
+        from django.db.models import F, Min
+
+        qs = (
+            qs.annotate(_polled=Min("lead__threads__last_polled_at"))
+            .order_by(F("_polled").asc(nulls_first=True), "last_action_at")[:limit]
+        )
 
     stopped = 0
     for state in qs:
@@ -148,6 +196,21 @@ def poll_replies(session, campaign=None, limit=None) -> int:
                 and m["sent_at"] >= state.created_at
             ):
                 our_outbound = True
+            # Reconcile a manual Unibox send: when we re-fetch the conversation,
+            # our own outbound reply comes back with a synthesised id that differs
+            # from the "manual-…" id we stored at queue time. Re-key the existing
+            # manual row to the real id so the get_or_create below matches it
+            # instead of inserting a duplicate.
+            if m["direction"] == "out":
+                manual = Message.objects.filter(
+                    thread=thread, direction="out", sent_via_tool=True, body=m["body"],
+                    linkedin_message_id__startswith="manual-",
+                ).first()
+                if manual is not None and manual.linkedin_message_id != m["linkedin_message_id"]:
+                    manual.linkedin_message_id = m["linkedin_message_id"]
+                    if m["sent_at"]:
+                        manual.sent_at = m["sent_at"]
+                    manual.save(update_fields=["linkedin_message_id", "sent_at"])
             _obj, created = Message.objects.get_or_create(
                 thread=thread,
                 linkedin_message_id=m["linkedin_message_id"],

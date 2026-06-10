@@ -14,12 +14,16 @@ from urllib.parse import quote
 from django.contrib.admin.views.decorators import staff_member_required
 from django.http import HttpResponse, JsonResponse
 from django.shortcuts import render
-from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_POST
 
 
+@ensure_csrf_cookie
 @staff_member_required
 def dashboard_page(request):
+    # ensure_csrf_cookie guarantees the csrftoken cookie is set so the page's
+    # fetch helper can send it back as X-CSRFToken on mutating requests — the
+    # mutating endpoints enforce CSRF (no more blanket @csrf_exempt).
     return render(request, "dashboard/dashboard.html", {})
 
 
@@ -125,7 +129,6 @@ def api_ai_config(request):
     })
 
 
-@csrf_exempt
 @staff_member_required
 @require_POST
 def api_ai_config_save(request):
@@ -153,7 +156,6 @@ def api_ai_config_save(request):
     return JsonResponse({"ok": True})
 
 
-@csrf_exempt
 @staff_member_required
 @require_POST
 def api_slack_test(request):
@@ -168,7 +170,6 @@ def api_slack_test(request):
     return JsonResponse({"ok": ok} if ok else {"error": "Slack didn't accept the message — check the webhook URL"}, status=200 if ok else 400)
 
 
-@csrf_exempt
 @staff_member_required
 @require_POST
 def api_context_save(request):
@@ -181,7 +182,6 @@ def api_context_save(request):
     return JsonResponse({"ok": True})
 
 
-@csrf_exempt
 @staff_member_required
 @require_POST
 def api_update_step(request, step_id):
@@ -231,7 +231,6 @@ def api_update_step(request, step_id):
     return JsonResponse({"ok": True, "step_type": step.step_type, "config": step.config})
 
 
-@csrf_exempt
 @staff_member_required
 @require_POST
 def api_delete_step(request, step_id):
@@ -249,10 +248,22 @@ def api_delete_step(request, step_id):
         return JsonResponse(
             {"error": "This step splits into two paths — remove one path first."}, status=400,
         )
-    for child in (succ or fail):
+    spliced = succ or fail
+    for child in spliced:
         child.parent = step.parent
         child.branch = step.branch
         child.save(update_fields=["parent", "branch"])
+    # Re-point any lead currently parked on this step onto the spliced-in
+    # successor so it continues the flow. Without this the FK SET_NULL leaves
+    # current_step=None and the executor silently COMPLETEs the lead, skipping
+    # the rest of the branch. If the step was a leaf (no successor), completing
+    # is the correct outcome, so leave those to SET_NULL.
+    from linkedin.models import LeadCampaignState
+    if spliced:
+        successor = spliced[0]
+        LeadCampaignState.objects.filter(current_step=step).update(
+            current_step=successor, current_branch=successor.branch,
+        )
     step.delete()
     return JsonResponse({"ok": True})
 
@@ -318,7 +329,6 @@ def api_accounts(request):
     return JsonResponse({"accounts": out})
 
 
-@csrf_exempt
 @staff_member_required
 @require_POST
 def api_account_add(request):
@@ -340,13 +350,13 @@ def api_account_add(request):
     user.save()
     prof = LinkedInProfile.objects.create(
         user=user, linkedin_username=email, linkedin_password=password,
-        has_inmail=bool(payload.get("has_inmail")), totp_secret=payload.get("totp_secret", "") or "",
+        has_inmail=bool(payload.get("has_inmail")),
+        totp_secret=(payload.get("totp_secret") or "").replace(" ", "").upper(),
         legal_accepted=True,
     )
     return JsonResponse({"ok": True, "id": prof.pk})
 
 
-@csrf_exempt
 @staff_member_required
 @require_POST
 def api_account_update(request, account_id):
@@ -356,39 +366,72 @@ def api_account_update(request, account_id):
     if not prof:
         return JsonResponse({"error": "not found"}, status=404)
     payload = json.loads(request.body or "{}")
+
+    def _int(key):
+        """Parse payload[key] as int, or None if absent/blank/invalid — so a
+        cleared numeric field in the UI (value "") is ignored instead of 500-ing
+        the whole save with int("")."""
+        v = payload.get(key)
+        if v is None or v == "":
+            return None
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
     if "active" in payload:
         prof.active = bool(payload["active"])
     if "has_inmail" in payload:
         prof.has_inmail = bool(payload["has_inmail"])
-    if payload.get("totp_secret"):
-        prof.totp_secret = payload["totp_secret"]
-    if payload.get("inmail_monthly_cap") is not None:
-        prof.inmail_monthly_cap = int(payload["inmail_monthly_cap"])
-    caps = prof.daily_caps_json or {}
-    if payload.get("connect_cap") is not None:
-        caps["connect"] = int(payload["connect_cap"])
-    if payload.get("message_cap") is not None:
-        caps["message"] = int(payload["message_cap"])
+    # TOTP secret: presence of the key (even empty) lets the UI clear/rotate it.
+    # Spaces are stripped + uppercased so a wrong/blank value can actually be
+    # corrected — the old `if payload.get(...)` made the secret write-once.
+    if "totp_secret" in payload:
+        prof.totp_secret = (payload.get("totp_secret") or "").replace(" ", "").upper()
+    # Allow rotating the LinkedIn email/password from the dashboard. Changing
+    # either invalidates the saved cookie session, so drop it to force a fresh
+    # (TOTP-aware) login on the next worker cycle.
+    creds_changed = False
+    if payload.get("linkedin_username"):
+        prof.linkedin_username = str(payload["linkedin_username"]).strip()[:200]
+        creds_changed = True
+    if payload.get("linkedin_password"):
+        prof.linkedin_password = str(payload["linkedin_password"])[:200]
+        creds_changed = True
+    if creds_changed:
+        prof.cookie_data = None
+    if _int("inmail_monthly_cap") is not None:
+        prof.inmail_monthly_cap = max(0, _int("inmail_monthly_cap"))
+    # Start from the full default set so we never drop the action types the UI
+    # doesn't expose (inmail/profile_visit/like_post) — dropping them would zero
+    # their cap and stall those sequence steps.
+    from linkedin.models import default_daily_caps
+    caps = {**default_daily_caps(), **(prof.daily_caps_json or {})}
+    for ui_key, cap_key in (("connect_cap", "connect"), ("message_cap", "message"),
+                            ("inmail_cap", "inmail"), ("profile_visit_cap", "profile_visit"),
+                            ("like_post_cap", "like_post")):
+        if _int(ui_key) is not None:
+            caps[cap_key] = max(0, _int(ui_key))
     prof.daily_caps_json = caps
     # Per-account send schedule.
-    if payload.get("send_start_hour") is not None:
-        prof.send_start_hour = max(0, min(23, int(payload["send_start_hour"])))
-    if payload.get("send_end_hour") is not None:
-        prof.send_end_hour = max(1, min(24, int(payload["send_end_hour"])))
+    if _int("send_start_hour") is not None:
+        prof.send_start_hour = max(0, min(23, _int("send_start_hour")))
+    if _int("send_end_hour") is not None:
+        prof.send_end_hour = max(1, min(24, _int("send_end_hour")))
     if payload.get("send_timezone"):
         prof.send_timezone = str(payload["send_timezone"])[:64]
     if isinstance(payload.get("send_weekdays"), list):
-        prof.send_weekdays = [int(d) for d in payload["send_weekdays"] if 0 <= int(d) <= 6]
+        prof.send_weekdays = [int(d) for d in payload["send_weekdays"] if str(d).lstrip("-").isdigit() and 0 <= int(d) <= 6]
     if "skip_bank_holidays" in payload:
         prof.skip_bank_holidays = bool(payload["skip_bank_holidays"])
     if payload.get("holiday_country"):
         prof.holiday_country = str(payload["holiday_country"])[:8].upper()
     if "connect_random_enabled" in payload:
         prof.connect_random_enabled = bool(payload["connect_random_enabled"])
-    if payload.get("connect_random_min") is not None:
-        prof.connect_random_min = max(0, int(payload["connect_random_min"]))
-    if payload.get("connect_random_max") is not None:
-        prof.connect_random_max = max(0, int(payload["connect_random_max"]))
+    if _int("connect_random_min") is not None:
+        prof.connect_random_min = max(0, _int("connect_random_min"))
+    if _int("connect_random_max") is not None:
+        prof.connect_random_max = max(0, _int("connect_random_max"))
     prof.save()
     return JsonResponse({"ok": True})
 
@@ -415,7 +458,6 @@ def api_campaigns(request):
     return JsonResponse({"campaigns": out})
 
 
-@csrf_exempt
 @staff_member_required
 @require_POST
 def api_campaign_create(request):
@@ -462,7 +504,6 @@ def _set_states(campaign, from_states, to_state, *, due_now=False):
     return qs.update(**fields)
 
 
-@csrf_exempt
 @staff_member_required
 @require_POST
 def api_campaign_update(request, campaign_id):
@@ -503,7 +544,6 @@ def api_campaign_update(request, campaign_id):
     return JsonResponse({"ok": True, "status": campaign.status, "enrolled": enrolled})
 
 
-@csrf_exempt
 @staff_member_required
 @require_POST
 def api_campaign_add_leads(request, campaign_id):
@@ -686,8 +726,16 @@ def api_inbox_thread(request, thread_id):
     if t.read_at is None:
         t.read_at = timezone.now()
         t.save(update_fields=["read_at"])
+    from linkedin.inbox.poller import MAX_MANUAL_SEND_ATTEMPTS
     msgs = [
-        {"direction": m.direction, "body": m.body, "sent_at": m.sent_at.isoformat() if m.sent_at else ""}
+        {
+            "direction": m.direction,
+            "body": m.body,
+            "sent_at": m.sent_at.isoformat() if m.sent_at else "",
+            "pending": m.pending_send,
+            "failed": (not m.pending_send and bool(m.send_error) and m.send_attempts >= MAX_MANUAL_SEND_ATTEMPTS),
+            "send_error": m.send_error,
+        }
         for m in t.messages.order_by("sent_at", "fetched_at")
     ]
     return JsonResponse({
@@ -712,7 +760,6 @@ def api_leads(request):
     return JsonResponse({"lists": lists})
 
 
-@csrf_exempt
 @staff_member_required
 @require_POST
 def api_leads_csv(request):
@@ -751,7 +798,6 @@ def _build_search_url(filters: dict) -> str:
     return "https://www.linkedin.com/search/results/people/?" + urlencode(params)
 
 
-@csrf_exempt
 @staff_member_required
 @require_POST
 def api_leads_search(request):
@@ -782,7 +828,6 @@ def api_leads_search(request):
     return JsonResponse({"ok": True, "queued": True, "list_id": ll.pk})
 
 
-@csrf_exempt
 @staff_member_required
 @require_POST
 def api_leads_ai(request):
@@ -807,7 +852,6 @@ def api_leads_ai(request):
     return JsonResponse({"ok": True, "queued": True, "list_id": ll.pk})
 
 
-@csrf_exempt
 @staff_member_required
 @require_POST
 def api_leads_continue(request, list_id):
@@ -879,7 +923,6 @@ def api_leadlist_events(request, list_id):
     return JsonResponse({"name": ll.name, "source": ll.source_type, "events": events})
 
 
-@csrf_exempt
 @staff_member_required
 @require_POST
 def api_inbox_send(request, thread_id):
@@ -899,13 +942,15 @@ def api_inbox_send(request, thread_id):
     if not body:
         return JsonResponse({"error": "empty message"}, status=400)
     mid = "manual-" + hashlib.sha1((body + str(timezone.now())).encode()).hexdigest()[:16]
+    # sent_at stays NULL until the worker actually sends it — the Unibox renders a
+    # "queued" pill while pending_send is True, so the UI never claims a message
+    # was sent before it left the browser.
     Message.objects.create(
         thread=t, direction="out", body=body, sent_via_tool=True, pending_send=True,
-        sender_account=t.account, linkedin_message_id=mid, sent_at=timezone.now(),
+        sender_account=t.account, linkedin_message_id=mid, sent_at=None,
     )
-    t.last_message_at = timezone.now()
     t.contacted_by_tool = True  # a manual reply is us contacting them
-    t.save(update_fields=["last_message_at", "contacted_by_tool"])
+    t.save(update_fields=["contacted_by_tool"])
     return JsonResponse({"ok": True, "queued": True})
 
 
@@ -929,7 +974,6 @@ def api_leadlist_export(request, list_id):
     return resp
 
 
-@csrf_exempt
 @staff_member_required
 @require_POST
 def api_create_sequence(request):
@@ -953,7 +997,6 @@ _STEP_DEFAULTS = {
 }
 
 
-@csrf_exempt
 @staff_member_required
 @require_POST
 def api_sequence_archive(request, sequence_id):
@@ -966,7 +1009,6 @@ def api_sequence_archive(request, sequence_id):
     return JsonResponse({"ok": True})
 
 
-@csrf_exempt
 @staff_member_required
 @require_POST
 def api_sequence_duplicate(request, sequence_id):
@@ -993,7 +1035,6 @@ def api_sequence_duplicate(request, sequence_id):
     return JsonResponse({"ok": True, "id": new.pk})
 
 
-@csrf_exempt
 @staff_member_required
 @require_POST
 def api_sequence_rename(request, sequence_id):
@@ -1010,7 +1051,6 @@ def api_sequence_rename(request, sequence_id):
     return JsonResponse({"ok": True})
 
 
-@csrf_exempt
 @staff_member_required
 @require_POST
 def api_create_step(request, sequence_id):
@@ -1084,8 +1124,13 @@ def api_kpis(request):
         replies_q = replies_q.filter(account_id=account)
 
     return JsonResponse({
+        # Accepted connections are recorded as connect_accepted ActionLog events
+        # (by the executor when it detects acceptance; backfill_acceptances seeds
+        # historical ones). Counting them here — rather than walking the flow tree
+        # — makes the tile honour the same period/campaign/account filters as every
+        # other KPI, which the tree-walk silently ignored.
         "connection_requests": actions("connect"),
-        "connections_accepted": _accepted_count(campaign),
+        "connections_accepted": actions("connect_accepted"),
         "messages_sent": actions("message"),
         "inmails_sent": actions("inmail"),
         "posts_liked": actions("like_post"),

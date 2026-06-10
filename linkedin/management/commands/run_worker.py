@@ -1,6 +1,10 @@
+import logging
 import time
+import traceback
 
 from django.core.management.base import BaseCommand
+
+logger = logging.getLogger(__name__)
 
 
 class Command(BaseCommand):
@@ -16,6 +20,12 @@ class Command(BaseCommand):
         from linkedin.ml.lead_score import score_pending_leads
         from linkedin.sequences.executor import enroll_active_campaigns, run_due_states
 
+        try:
+            from linkedin_cli.exceptions import AuthenticationError
+        except Exception:  # pragma: no cover - cli always present in prod
+            class AuthenticationError(Exception):
+                pass
+
         profile = get_first_active_profile()
         if not profile:
             self.stderr.write("No active LinkedIn profile.")
@@ -28,6 +38,7 @@ class Command(BaseCommand):
         # scoring) runs on its own slower clock so it can't starve the sender.
         HEAVY_EVERY = 600  # seconds
         last_heavy = 0.0
+        consecutive_errors = 0
         while True:
             from django.db import connection
 
@@ -52,11 +63,32 @@ class Command(BaseCommand):
                     last_heavy = now
                     extra = f" searches={searched} backfilled={backfilled} scored={scored}"
 
+                consecutive_errors = 0
                 self.stdout.write(
                     f"cycle: executed={executed} enrolled={enrolled['enrolled']} "
                     f"manual_sent={manual} replies_stopped={stopped}{extra}",
                     ending="\n",
                 )
+            except AuthenticationError as exc:
+                # The LinkedIn session is no longer valid (cookie revoked, password
+                # changed, etc). Try to recover by logging in fresh (TOTP-aware)
+                # instead of silently failing every cycle forever.
+                consecutive_errors += 1
+                self.stderr.write(f"auth error — re-authenticating: {exc!r}")
+                logger.warning("Worker auth error; attempting reauthenticate()", exc_info=True)
+                try:
+                    session.reauthenticate()
+                    self.stdout.write(self.style.SUCCESS("re-authenticated OK"))
+                    consecutive_errors = 0
+                except Exception:
+                    logger.error("Re-authentication failed:\n%s", traceback.format_exc())
             except Exception as exc:  # keep the worker alive across transient errors
-                self.stderr.write(f"cycle error: {exc!r}"[:200])
-            time.sleep(interval)
+                consecutive_errors += 1
+                # Log the FULL traceback (the old 200-char repr hid the cause) so a
+                # recurring failure is diagnosable from the worker logs.
+                self.stderr.write(f"cycle error ({consecutive_errors}): {exc!r}")
+                logger.error("Worker cycle error:\n%s", traceback.format_exc())
+            # Back off on a run of failures so a hard-down dependency doesn't spin
+            # the loop (and the logs) at full speed.
+            sleep_for = interval * (min(consecutive_errors, 5) or 1) if consecutive_errors else interval
+            time.sleep(sleep_for)

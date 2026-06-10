@@ -94,7 +94,12 @@ class AccountSession:
                 expires = cookie.get("expires", -1)
                 if expires > 0 and expires < time.time():
                     logger.warning("Auth cookie expired for %s — re-authenticating", self)
+                    # Clear the stale cookies so the relaunch takes the fresh-login
+                    # branch (which runs the TOTP flow) instead of restoring the
+                    # expired session and failing the saved-session validation.
                     self.close()
+                    self.linkedin_profile.cookie_data = None
+                    self.linkedin_profile.save(update_fields=["cookie_data"])
                     start_browser_session(session=self)
                 return
 

@@ -493,6 +493,12 @@ class Message(models.Model):
     sent_via_tool = models.BooleanField(default=False)  # M5 inbox privacy default
     # A manual reply typed in the Unibox, queued for the worker to actually send.
     pending_send = models.BooleanField(default=False)
+    # Worker send bookkeeping for queued manual replies: how many send attempts
+    # have been made, and the last error. Bounds retries (a permanently-failing
+    # send must not re-attempt a live browser action every cycle forever) and
+    # lets the Unibox show a queued/failed state instead of a fake "sent".
+    send_attempts = models.PositiveSmallIntegerField(default=0)
+    send_error = models.CharField(max_length=300, blank=True, default="")
     fetched_at = models.DateTimeField(default=timezone.now)
 
     class Meta:

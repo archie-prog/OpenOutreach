@@ -28,6 +28,20 @@ def _save_cookies(session):
     session.linkedin_profile.save(update_fields=["cookie_data"])
 
 
+def _fresh_login(session):
+    """Run the login flow from scratch and persist the resulting cookies. Uses
+    the native TOTP path when the account has a secret, else the human-in-the-loop
+    ``linkedin_cli`` authenticator."""
+    lp = session.linkedin_profile
+    if lp.totp_secret:
+        from linkedin.auth.login import login_with_totp
+        login_with_totp(session, lp.linkedin_username, lp.linkedin_password, lp.totp_secret)
+    else:
+        authenticate(session, username=lp.linkedin_username, password=lp.linkedin_password)
+    _save_cookies(session)
+    logger.info(colored("Login successful – session saved", "green", attrs=["bold"]))
+
+
 def start_browser_session(session):
     logger.debug("Configuring browser for %s", session)
 
@@ -41,23 +55,24 @@ def start_browser_session(session):
     session.page, session.context, session.browser, session.playwright = launch_browser(storage_state=storage_state)
 
     if not storage_state:
-        lp = session.linkedin_profile
-        if lp.totp_secret:
-            from linkedin.auth.login import login_with_totp
-            login_with_totp(session, lp.linkedin_username, lp.linkedin_password, lp.totp_secret)
-        else:
-            authenticate(session, username=lp.linkedin_username, password=lp.linkedin_password)
-        _save_cookies(session)
-        logger.info(colored("Login successful – session saved", "green", attrs=["bold"]))
+        _fresh_login(session)
     else:
         session.page.goto(LINKEDIN_FEED_URL)
         dismiss_comply_gate(session.page)
-        goto_page(
-            session,
-            action=lambda: None,
-            expected_url_pattern="/feed",
-            error_message="Saved session invalid",
-        )
+        try:
+            goto_page(
+                session,
+                action=lambda: None,
+                expected_url_pattern="/feed",
+                error_message="Saved session invalid",
+            )
+        except Exception:
+            # The saved cookies no longer authenticate (expired/revoked). Drop
+            # them and log in fresh (TOTP-aware) rather than dead-ending.
+            logger.warning("Saved session invalid for %s — logging in fresh", session)
+            session.linkedin_profile.cookie_data = None
+            session.linkedin_profile.save(update_fields=["cookie_data"])
+            _fresh_login(session)
 
     # "domcontentloaded" — "load" waits for every subresource (analytics
     # beacons, lazy media) and on LinkedIn that event may never fire,

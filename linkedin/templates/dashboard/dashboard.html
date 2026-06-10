@@ -28,6 +28,13 @@
     #camps button.no, #leadlists button.no { background: #fef2f2; color: #b91c1c; border-color: #fecaca; }
     #camps select, #leadlists select { font-size: 12px; padding: 3px 6px; border: 1px solid #d1d5db; border-radius: 6px; }
     #accts tr.schedrow td { background: #f8fafc; color: #374151; }
+    #toasts { position: fixed; top: 16px; right: 16px; z-index: 9999; display: flex; flex-direction: column; gap: 8px; max-width: 380px; }
+    .toast { padding: 12px 16px; border-radius: 8px; font-size: 14px; box-shadow: 0 4px 14px rgba(0,0,0,.18); color: #fff; cursor: pointer; animation: toastin .15s ease-out; }
+    .toast.err { background: #b91c1c; } .toast.ok { background: #166534; } .toast.info { background: #1e40af; }
+    @keyframes toastin { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
+    .msg.pending { opacity: .7; } .msg.failed { border-left: 3px solid #b91c1c; }
+    .sendstate { font-size: 11px; margin-top: 2px; }
+    .sendstate.pending { color: #92400e; } .sendstate.failed { color: #b91c1c; }
     .warnbanner { background: #fef3c7; border: 1px solid #fde68a; color: #92400e; padding: 10px 14px; border-radius: 8px; margin: 10px 0; font-size: 13px; }
     .tablescroll { overflow-x: auto; }
     .tablescroll table { min-width: 760px; }
@@ -134,6 +141,7 @@
 <body>
   <header>OpenOutreach — Grantgunner</header>
   <nav id="nav"></nav>
+  <div id="toasts"></div>
   <div class="wrap">
     <div class="tab active" id="tab-dashboard">
       <div class="filterbar">
@@ -342,7 +350,61 @@
   </div>
 
   <script>
-    const j = (u, o) => fetch(u, o).then(r => r.json());
+    // ── Toasts + robust fetch ───────────────────────────────────────────
+    // The old helper was `fetch(u,o).then(r => r.json())` with no error
+    // handling: any 500, 400, or an expired-session HTML redirect made
+    // r.json() throw, the .then chain die, and the UI go silently dead — the
+    // single biggest source of "it builds but doesn't work". j() now surfaces
+    // every failure as a toast and rejects so success handlers don't run on bad
+    // data; a global handler backstops any uncaught rejection.
+    function toast(msg, kind) {
+      const box = document.getElementById("toasts");
+      if (!box) { console.error(msg); return; }
+      const el = document.createElement("div");
+      el.className = "toast " + (kind || "info");
+      el.textContent = msg;
+      el.onclick = () => el.remove();
+      box.appendChild(el);
+      setTimeout(() => el.remove(), kind === "err" ? 8000 : 4000);
+    }
+    function getCookie(name) {
+      const m = document.cookie.match("(^|;)\\s*" + name + "\\s*=\\s*([^;]+)");
+      return m ? decodeURIComponent(m.pop()) : "";
+    }
+    async function j(u, o) {
+      o = o || {};
+      const method = (o.method || "GET").toUpperCase();
+      if (method !== "GET" && method !== "HEAD") {
+        o.headers = Object.assign({ "X-CSRFToken": getCookie("csrftoken") }, o.headers || {});
+      }
+      let r;
+      try {
+        r = await fetch(u, o);
+      } catch (e) {
+        toast("Network error — is the server reachable?", "err");
+        throw e;
+      }
+      if (r.status === 401 || r.status === 403 || (r.redirected && /\/login/.test(r.url))) {
+        toast("Your session expired — reload the page to sign in again.", "err");
+        throw new Error("auth");
+      }
+      const ct = r.headers.get("content-type") || "";
+      if (!ct.includes("application/json")) {
+        toast("Unexpected response from the server (" + r.status + ").", "err");
+        throw new Error("non-json " + r.status);
+      }
+      const data = await r.json();
+      if (!r.ok) {
+        toast(data.error || ("Request failed (" + r.status + ")"), "err");
+        throw new Error(data.error || ("http " + r.status));
+      }
+      return data;
+    }
+    // Backstop: a rejected j() whose caller had no .catch already showed a toast;
+    // swallow it so it doesn't spam the console as "Uncaught (in promise)".
+    window.addEventListener("unhandledrejection", (e) => {
+      if (e.reason && /^(auth|non-json|http )/.test(String(e.reason.message || ""))) e.preventDefault();
+    });
     const TABS = [["dashboard","Dashboard"],["flows","Flows"],["unibox","Unibox"],["accounts","Accounts"],["leads","Leads"],["campaigns","Campaigns"],["context","AI Context"]];
     const nav = document.getElementById("nav");
     TABS.forEach(([id, label], i) => { const b = document.createElement("button"); b.textContent = label; b.className = i===0?"active":""; b.onclick = () => showTab(id, b); nav.appendChild(b); });
@@ -403,6 +465,13 @@
             &nbsp;&nbsp;${days}
             &nbsp;&nbsp;<label style="display:inline;font-size:12px"><input type="checkbox" ${a.skip_bank_holidays?"checked":""} id="ac_bh_${a.id}"> Skip bank holidays</label>
             <select id="ac_hc_${a.id}" style="width:180px">${countryOptions(a.holiday_country||'GB')}</select>
+            <div style="margin-top:8px;font-size:12px">
+              <b>Security</b> &nbsp;2FA: <span style="font-weight:600;color:${a.has_totp?'#166534':'#6b7280'}">${a.has_totp?"on":"off"}</span>
+              <input id="ac_totp_${a.id}" placeholder="${a.has_totp?'new TOTP secret (blank = keep)':'add base32 TOTP secret'}" style="width:210px">
+              ${a.has_totp?`<button onclick="clearTotp(${a.id})">Clear 2FA</button>`:""}
+              &nbsp;&nbsp;Rotate login: <input id="ac_email_${a.id}" placeholder="new email (blank = keep)" style="width:170px">
+              <input id="ac_pw_${a.id}" type="password" placeholder="new password" style="width:140px" autocomplete="new-password">
+            </div>
           </td></tr>`;
         }).join("") || `<tr><td colspan="8">No accounts.</td></tr>`;
         checkConnectCaps();
@@ -427,7 +496,7 @@
     };
     window.saveAccount = (id) => {
       const weekdays = []; for (let i=0;i<7;i++){ if (document.getElementById("ac_wd_"+id+"_"+i).checked) weekdays.push(i); }
-      j(`api/account/${id}/`, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({
+      const body = {
         active: document.getElementById("ac_active_"+id).checked,
         has_inmail: document.getElementById("ac_inmail_"+id).checked,
         connect_cap: document.getElementById("ac_conn_"+id).value,
@@ -442,13 +511,27 @@
         send_weekdays: weekdays,
         skip_bank_holidays: document.getElementById("ac_bh_"+id).checked,
         holiday_country: document.getElementById("ac_hc_"+id).value,
-      })}).then(r => { if(r.ok) loadAccounts(); else alert(r.error||"failed"); });
+      };
+      // Only send security fields when the user actually typed something —
+      // sending an empty totp_secret would CLEAR it, an empty password is a no-op.
+      const totp = gv("ac_totp_"+id), email = gv("ac_email_"+id), pw = gv("ac_pw_"+id);
+      if (totp) body.totp_secret = totp;
+      if (email) body.linkedin_username = email;
+      if (pw) body.linkedin_password = pw;
+      j(`api/account/${id}/`, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)})
+        .then(r => { if(r.ok){ toast("Account saved"+((email||pw)?" — saved login will re-authenticate on the next worker cycle":""), "ok"); loadAccounts(); } });
+    };
+    window.clearTotp = (id) => {
+      if (!confirm("Remove 2FA from this account? Login will then wait for a human at the 2FA challenge.")) return;
+      j(`api/account/${id}/`, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({totp_secret:""})})
+        .then(r => { if(r.ok){ toast("2FA secret cleared", "ok"); loadAccounts(); } });
     };
     window.addAccount = () => {
+      if (!gv("acc_email") || !gv("acc_pw")) { toast("Enter the LinkedIn email and password.", "err"); return; }
       j("api/accounts/add/", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({
         username: gv("acc_email"), password: gv("acc_pw"), totp_secret: gv("acc_totp"),
         has_inmail: document.getElementById("acc_inmail").checked,
-      })}).then(r => { if(r.ok){ document.getElementById("acc_email").value=""; document.getElementById("acc_pw").value=""; document.getElementById("acc_totp").value=""; loadAccounts(); alert("Account added."); } else alert(r.error||"failed"); });
+      })}).then(r => { if(r.ok){ document.getElementById("acc_email").value=""; document.getElementById("acc_pw").value=""; document.getElementById("acc_totp").value=""; loadAccounts(); toast("Account added.", "ok"); } });
     };
 
     let CAMP_LEADS = [], CAMP_SORT = "ai_score", CAMP_DESC = true;
@@ -526,7 +609,7 @@
         ];
         document.getElementById("cd-stats").innerHTML = tiles.map(([l,v]) => `<div class="kpi"><div class="label">${l}</div><div class="value">${v}</div></div>`).join("");
         document.getElementById("cd-responses").innerHTML = d.responses.length
-          ? d.responses.map(r => `<div class="feedrow"><div><b>${r.lead_name}</b> <span class="hint">${r.at}</span> <a href="${r.lead_url}" target="_blank">↗</a></div><div class="feedbody">${esc(r.body)}</div></div>`).join("")
+          ? d.responses.map(r => `<div class="feedrow"><div><b>${esc(r.lead_name)}</b> <span class="hint">${esc(r.at)}</span> <a href="${esc(r.lead_url)}" target="_blank">↗</a></div><div class="feedbody">${esc(r.body)}</div></div>`).join("")
           : `<div class="hint">No replies yet.</div>`;
         document.getElementById("cd-activity").innerHTML = d.activity.length
           ? d.activity.map(a => activityRow(a)).join("")
@@ -542,9 +625,9 @@
       const rows = CAMP_LEADS.filter(l => !sf || l.state === sf);
       rows.sort((a,b) => { let x=a[CAMP_SORT], y=b[CAMP_SORT]; if(x==null)x=(CAMP_SORT==="ai_score"?-1:""); if(y==null)y=(CAMP_SORT==="ai_score"?-1:""); return (x<y?-1:x>y?1:0)*(CAMP_DESC?-1:1); });
       document.querySelector("#campleads tbody").innerHTML = rows.map(l => `<tr>
-        <td>${l.lead_name}</td><td>${(l.title||"").slice(0,45)}</td><td>${(l.company||"").slice(0,25)}</td>
-        <td>${l.ai_score==null?"—":l.ai_score}</td><td>${l.stage}</td><td>${l.state}</td>
-        <td><a href="${l.lead_url}" target="_blank">↗</a></td></tr>`).join("") || `<tr><td colspan="7">No leads in this campaign.</td></tr>`;
+        <td>${esc(l.lead_name)}</td><td>${esc((l.title||"").slice(0,45))}</td><td>${esc((l.company||"").slice(0,25))}</td>
+        <td>${l.ai_score==null?"—":l.ai_score}</td><td>${esc(l.stage)}</td><td>${esc(l.state)}</td>
+        <td><a href="${esc(l.lead_url)}" target="_blank">↗</a></td></tr>`).join("") || `<tr><td colspan="7">No leads in this campaign.</td></tr>`;
     }
 
     function loadContext(){
@@ -655,8 +738,8 @@
         if (!d.threads.length){ list.innerHTML = `<div class="hint" style="padding:16px">No conversations yet.</div>`; return; }
         list.innerHTML = d.threads.map(t => `
           <div class="threadrow ${t.unread?"unread":""} ${t.id===CUR_THREAD?"sel":""}" onclick="openThread(${t.id})">
-            <div class="nm">${t.unread?'<span class="dot"></span>':""}${t.lead_name} <span class="acctbadge" title="LinkedIn account">${t.account_name}</span></div>
-            <div class="pre">${t.last_direction==="out"?"You: ":""}${(t.last_message||"").replace(/</g,"&lt;")}</div>
+            <div class="nm">${t.unread?'<span class="dot"></span>':""}${esc(t.lead_name)} <span class="acctbadge" title="LinkedIn account">${esc(t.account_name)}</span></div>
+            <div class="pre">${t.last_direction==="out"?"You: ":""}${esc(t.last_message||"")}</div>
           </div>`).join("");
       });
     }
@@ -664,10 +747,16 @@
       CUR_THREAD = id;
       j(`api/inbox/thread/${id}/`).then(t => {
         document.getElementById("convo").innerHTML =
-          `<div class="convohead">${t.lead_name} <span class="acctbadge">via ${t.account_name}</span>` +
-          (t.lead_url ? ` <a href="${t.lead_url}" target="_blank" style="font-size:12px;font-weight:400;margin-left:8px">↗ View on LinkedIn</a>` : "") + `</div>` +
-          t.messages.map(m => `<div class="msg ${m.direction}"><div class="who">${m.direction==="out"?("You ("+t.account_name+")"):t.lead_name}</div>${(m.body||"").replace(/</g,"&lt;")}</div>`).join("") +
-          `<div style="margin-top:14px;display:flex;gap:8px"><input id="composebox" placeholder="Type a reply, sent from ${t.account_name}…" style="flex:1" onkeydown="if(event.key==='Enter')sendMsg(${id})"><button onclick="sendMsg(${id})" style="background:#2563eb;color:#fff;border:none;border-radius:6px;padding:7px 16px;cursor:pointer">Send</button></div>`;
+          `<div class="convohead">${esc(t.lead_name)} <span class="acctbadge">via ${esc(t.account_name)}</span>` +
+          (t.lead_url ? ` <a href="${esc(t.lead_url)}" target="_blank" style="font-size:12px;font-weight:400;margin-left:8px">↗ View on LinkedIn</a>` : "") + `</div>` +
+          t.messages.map(m => {
+            const who = m.direction==="out" ? ("You ("+esc(t.account_name)+")") : esc(t.lead_name);
+            const stateCls = m.pending ? "pending" : (m.failed ? "failed" : "");
+            const stateNote = m.pending ? `<div class="sendstate pending">⏳ queued — sending on the next worker cycle</div>`
+              : (m.failed ? `<div class="sendstate failed">⚠️ failed to send${m.send_error?(": "+esc(m.send_error)):""}</div>` : "");
+            return `<div class="msg ${m.direction} ${stateCls}"><div class="who">${who}</div>${esc(m.body||"")}${stateNote}</div>`;
+          }).join("") +
+          `<div style="margin-top:14px;display:flex;gap:8px"><input id="composebox" placeholder="Type a reply, sent from ${esc(t.account_name)}…" style="flex:1" onkeydown="if(event.key==='Enter')sendMsg(${id})"><button onclick="sendMsg(${id})" style="background:#2563eb;color:#fff;border:none;border-radius:6px;padding:7px 16px;cursor:pointer">Send</button></div>`;
         loadThreads();
       });
     };
@@ -794,10 +883,10 @@
       else KCHART = new Chart(ctx, { type:"line", data, options:opts });
     }
     function activityRow(a){
-      const who = a.lead && a.lead !== "—" ? ` — <b>${a.lead}</b>` : "";
-      const profile = a.lead_url ? ` <a href="${a.lead_url}" target="_blank">View profile ↗</a>` : "";
-      const post = (a.action === "like_post" && a.post_url) ? ` · <a href="${a.post_url}" target="_blank">View liked post ↗</a>` : "";
-      return `<div class="feedrow"><span>${ACT_LABEL[a.action]||a.action}${who}${profile}${post}</span> <span class="hint">${a.at} · ${a.account}</span></div>`;
+      const who = a.lead && a.lead !== "—" ? ` — <b>${esc(a.lead)}</b>` : "";
+      const profile = a.lead_url ? ` <a href="${esc(a.lead_url)}" target="_blank">View profile ↗</a>` : "";
+      const post = (a.action === "like_post" && a.post_url) ? ` · <a href="${esc(a.post_url)}" target="_blank">View liked post ↗</a>` : "";
+      return `<div class="feedrow"><span>${ACT_LABEL[a.action]||a.action}${who}${profile}${post}</span> <span class="hint">${esc(a.at)} · ${esc(a.account)}</span></div>`;
     }
     function loadActivity(){
       const days = document.getElementById("dashdays").value;
@@ -831,7 +920,12 @@
     // ---------- Flow builder ----------
     const STEP_TYPES = [["connect","Send Connection Request"],["message","Send Message"],["inmail","Send InMail"],["wait","Wait"],["profile_visit","View Profile"],["like_post","Like Post"],["end","End — stop here"],["blank","Blank — no action (resume)"]];
     const FIELDS = { connect:[["personalised_note","Connection note","textarea"],["wait_days_before_branch_decision","Days to wait for acceptance","number"]], message:[["template","Message","textarea"]], inmail:[["subject","Subject","input"],["body","Body","textarea"]], wait:[["days","Wait days","number"]], profile_visit:[], like_post:[] };
-    function branchOpts(t){ if(t==="end")return[]; if(t==="connect")return[["success","if accepted","yes"],["failure","if NOT accepted","no"]]; if(t==="message")return[["success","if replied","yes"],["failure","if no reply","no"]]; return[["success","then (next step)","yes"]]; }
+    // Connect is the only branching step (accepted vs not). Message continues
+    // linearly — a reply STOPS the sequence (the "stop on reply" safety rule), so
+    // there is no "if replied" path to build onto. The engine reads a message
+    // step's next step on the FAILURE branch, so the single continuation slot maps
+    // there (keeps existing steps valid; no data migration).
+    function branchOpts(t){ if(t==="end")return[]; if(t==="connect")return[["success","if accepted","yes"],["failure","if NOT accepted","no"]]; if(t==="message")return[["failure","then (next step)","yes"]]; return[["success","then (next step)","yes"]]; }
     let CUR = null;
 
     function typePicker(parentId, branch){

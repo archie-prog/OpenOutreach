@@ -39,8 +39,13 @@ def cap_for(account, action_type, date=None) -> int:
             seed = int.from_bytes(digest[:8], "big")
             return _random.Random(seed).randint(lo, hi)
 
-    caps = account.daily_caps_json or default_daily_caps()
-    return int(caps.get(action_type, 0))
+    # Merge stored caps over the full defaults so an action type missing from a
+    # truncated daily_caps_json (e.g. a row saved before it carried inmail/
+    # profile_visit/like_post) falls back to its sensible default instead of 0 —
+    # a 0 would silently stall every sequence step of that type forever.
+    defaults = default_daily_caps()
+    caps = {**defaults, **(account.daily_caps_json or {})}
+    return int(caps.get(action_type, defaults.get(action_type, 0)))
 
 
 def daily_count(account, action_type, date=None) -> int:
@@ -126,6 +131,19 @@ def is_send_time(account, dt=None) -> bool:
     return account.send_start_hour <= local.hour < account.send_end_hour
 
 
+def _at_hour(local, hour):
+    """``local`` set to ``hour:00`` — but ``hour==24`` means midnight at the start
+    of the next day (datetime can't hold hour 24). The UI allows an end hour of 24
+    ('until midnight'); ``replace(hour=24)`` would raise ValueError and brick the
+    account's scheduling."""
+    from datetime import timedelta
+
+    if hour >= 24:
+        nxt = local + timedelta(days=1)
+        return nxt.replace(hour=0, minute=0, second=0, microsecond=0)
+    return local.replace(hour=hour, minute=0, second=0, microsecond=0)
+
+
 def next_send_time(account, dt=None):
     """Earliest send-eligible moment at or after ``dt`` for this account."""
     from datetime import timedelta
@@ -137,8 +155,8 @@ def next_send_time(account, dt=None):
     for _ in range(367):  # at most a year ahead
         ok_day = local.weekday() in weekdays and not _is_bank_holiday(account, local.date())
         if ok_day:
-            win_start = local.replace(hour=account.send_start_hour, minute=0, second=0, microsecond=0)
-            win_end = local.replace(hour=account.send_end_hour, minute=0, second=0, microsecond=0)
+            win_start = _at_hour(local, account.send_start_hour)
+            win_end = _at_hour(local, account.send_end_hour)
             if local < win_start:
                 return win_start  # window opens later today (tz-aware)
             if local < win_end:

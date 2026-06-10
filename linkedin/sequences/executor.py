@@ -123,9 +123,16 @@ def enroll_active_campaigns() -> dict:
 
 
 def due_states(campaign=None):
+    from linkedin.models import Campaign
+
+    # Only ever run leads whose campaign is ACTIVE — campaign.status is the single
+    # source of truth. This means adding leads to a DRAFT/PAUSED campaign can't
+    # start outreach before launch, and pausing a campaign halts it even for
+    # states created after the pause (which would otherwise be born ACTIVE+due).
     qs = LeadCampaignState.objects.filter(
         state=LeadCampaignState.State.ACTIVE,
         next_action_due_at__lte=timezone.now(),
+        campaign__status=Campaign.Status.ACTIVE,
     )
     if campaign is not None:
         qs = qs.filter(campaign=campaign)
@@ -211,7 +218,11 @@ def _handle_connect(session, state, step):
         return
     # Decision phase: accepted → success branch, else → failure branch.
     accepted = is_connection_accepted(session, state)
+    # Persist the cleared flag immediately — _goto/_complete below only save their
+    # own fields, so without this the row stays awaiting_decision=True forever,
+    # breaking any later connect step (it'd skip its send + cap gate).
     state.awaiting_decision = False
+    state.save(update_fields=["awaiting_decision"])
     if accepted:
         # Record the acceptance (a detected result of our outreach, not a capped
         # action) so the dashboard can report connections accepted.
@@ -288,7 +299,14 @@ def _handle_profile_visit(session, state, step):
 
 def _handle_like_post(session, state, step):
     result = like_recent_post(session, state) or {}
-    _log(session, state, step, ActionLog.ActionType.LIKE_POST, target_url=result.get("post_url", ""))
+    # Only record the like (which consumes the daily cap and feeds the "posts
+    # liked" KPI) when it actually succeeded — e.g. the lead has no recent post,
+    # or the like button wasn't found. Otherwise we'd inflate the metric and burn
+    # cap on no-ops. The sequence still advances either way.
+    if result.get("success") or result.get("liked"):
+        _log(session, state, step, ActionLog.ActionType.LIKE_POST, target_url=result.get("post_url", ""))
+    else:
+        logger.info("Like skipped for %s (%s) — no record", state.lead_id, result.get("error") or "no recent post")
     _goto(state, step.next_step(Branch.SUCCESS))
 
 
@@ -368,10 +386,20 @@ def render_template(template: str, context: dict, fallback: str = "") -> str:
     try:
         import re
 
-        # {var} (single brace, no spaces) → context value; leaves {{ }} for Jinja.
-        text = re.sub(r"\{(\w+)\}", lambda m: str(context.get(m.group(1), "")), template)
         from jinja2 import Template
-        rendered = Template(text).render(**context).strip()
+
+        # Jinja FIRST so ``{{ first_name }}`` resolves correctly; a single brace
+        # ``{first_name}`` is literal text to Jinja and survives untouched.
+        text = Template(template).render(**context)
+        # Then the HeyReach-style single-brace tags. Only substitute KNOWN keys —
+        # an unknown ``{tag}`` is left verbatim rather than silently blanked, so a
+        # typo'd tag is visible instead of producing a half-empty message.
+        text = re.sub(
+            r"\{(\w+)\}",
+            lambda m: str(context[m.group(1)]) if m.group(1) in context else m.group(0),
+            text,
+        )
+        rendered = text.strip()
     except Exception:
         return fallback
     return rendered or fallback
@@ -399,8 +427,18 @@ def send_connection_request(session, state, step):
     # The connect verb assumes the profile page is already open; this navigates
     # there. get_connection_status takes a profile dict, not the id string.
     get_connection_status(session, pdict)
-    # NOTE: linkedin_cli's active connect flow sends WITHOUT a note; the
-    # personalised_note config is not yet wired (needs an app-side with-note flow).
+    # If the step carries a personalised note, send WITH it via the app-side flow
+    # (linkedin_cli's connect verb is note-less). Render placeholders first; fall
+    # back to the note-less verb if the note is empty or the with-note flow fails.
+    note = render_template(step.config.get("personalised_note", ""), _lead_context(state), "")
+    if note:
+        from linkedin.actions.connect_note import send_connection_request_with_note
+
+        result = send_connection_request_with_note(session, pdict, note)
+        if result.get("success"):
+            return
+        logger.warning("Connect-with-note failed for %s (%s) — sending note-less request",
+                       lead.public_identifier, result.get("error"))
     _send(session, pdict)
 
 
