@@ -184,15 +184,17 @@ def import_ai_search(session, lead_list, prompt: str, cap: int = 30, max_keyword
     session.ensure_browser()
     api = PlaywrightLinkedinAPI(session=session)
     created = 0
-    # Hygiene: search 2nd/3rd-degree only ("S","O") — never 1st ("F"). The AI
-    # finder must not pull in people you're already connected to (they'd only be
-    # skipped by the connection-provenance guard at send time anyway, and they
-    # clutter the list). Deliberately contacting existing connections is done via
-    # an explicit lead list + the campaign's "include current network" toggle.
+    # Connection-degree filter (per-list, default "S" = 2nd-degree only). The AI
+    # finder must never pull in 1st-degree ("F") — people you're already connected
+    # to; they'd only be skipped by the provenance guard at send time and clutter
+    # the list. 2nd-degree is the outreach sweet spot; 3rd ("O") is opt-in.
+    network = [c for c in (getattr(lead_list, "search_network", "S") or "S").split(",") if c in ("F", "S", "O")] or ["S"]
+    if "F" in network:
+        network = [c for c in network if c != "F"]  # never source 1st-degree via AI
     for kw in keywords:
         if created >= cap:
             break
-        for p in search_people(session, kw, network=["S", "O"]).get("profiles", []):
+        for p in search_people(session, kw, network=network).get("profiles", []):
             if created >= cap:
                 break
             url = p.get("url")

@@ -255,6 +255,9 @@
         <label>Describe who you are looking for (product / ideal customer)</label>
         <textarea id="aiprompt" rows="5" placeholder="e.g. Founders and heads of growth at early-stage UK fintech startups who would buy grant-finding software"></textarea>
         <label>How many leads (target)</label><input type="number" id="aitarget" value="30" min="1" style="width:90px">
+        <label>Connection degree</label>
+        <select id="ainet" style="width:auto"><option value="S">2nd-degree only (recommended)</option><option value="S,O">2nd + 3rd degree</option></select>
+        <div class="hint" style="margin-top:2px">Never includes 1st-degree (people already in your network). 2nd-degree = reachable via mutual connections — the outreach sweet spot.</div>
         <button id="aibtn" onclick="runAi()">Find with AI</button>
         <div class="hint">The LLM turns this into LinkedIn searches and enriches matches into a list (runs on the worker, ~couple of minutes).</div>
       </div>
@@ -962,11 +965,13 @@
     };
     window.runAi = () => {
       const name = gv("ainame"); const prompt = gv("aiprompt");
-      if(!prompt){ alert("Describe who you are looking for"); return; }
+      if(!prompt){ toast("Describe who you are looking for", "err"); return; }
       const target_count = parseInt(gv("aitarget"), 10) || 30;
+      const network = gv("ainet") || "S";
       const btn = document.getElementById("aibtn"); btn.textContent = "Queued — AI finding…"; btn.disabled = true;
-      j("api/leads/ai/", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({name, prompt, target_count})})
-        .then(r => { btn.textContent = "Find with AI"; btn.disabled = false; if(r.ok){ alert("AI search queued — leads appear in the list below in a couple of minutes. Hit refresh."); loadLeads(); } else alert(r.error||"failed"); });
+      j("api/leads/ai/", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({name, prompt, target_count, network})})
+        .then(r => { btn.textContent = "Find with AI"; btn.disabled = false; if(r.ok){ toast("AI search queued (2nd-degree" + (network.includes("O")?" + 3rd":"") + " only) — leads appear below in a couple of minutes.", "ok"); loadLeads(); } })
+        .catch(() => { btn.textContent = "Find with AI"; btn.disabled = false; });
     };
 
     const KPI = { connection_requests:"Connection Requests", connections_accepted:"Connections Accepted", messages_sent:"Messages Sent", inmails_sent:"InMails Sent", posts_liked:"Posts Liked", replies:"Replies", active:"Active", completed:"Completed" };

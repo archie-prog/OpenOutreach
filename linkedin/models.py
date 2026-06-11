@@ -151,6 +151,11 @@ class LeadList(models.Model):
     pending_search = models.BooleanField(default=False)
     # How many leads to gather for this list — the worker keeps filling toward it.
     target_count = models.PositiveIntegerField(default=30)
+    # Connection-degree filter for the AI lead finder, as LinkedIn degree codes
+    # (F=1st, S=2nd, O=3rd+), comma-separated. Default "S" = 2nd-degree only — the
+    # outreach sweet spot. Never includes 1st-degree (existing connections) unless
+    # the user deliberately chooses to.
+    search_network = models.CharField(max_length=20, default="S")
     created_at = models.DateTimeField(default=timezone.now)
     archived_at = models.DateTimeField(null=True, blank=True)
 

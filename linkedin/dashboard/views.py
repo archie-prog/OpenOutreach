@@ -957,8 +957,12 @@ def api_leads_ai(request):
         name=name, owner=request.user, source_type=LeadList.SourceType.AI, source_url=prompt[:2000],
     )
     ll.target_count = int(payload.get("target_count") or 30)
+    # Connection-degree filter: "S" (2nd only, default), "S,O" (2nd+3rd). "F" is
+    # always stripped — the AI finder never sources 1st-degree connections.
+    net = [c for c in (payload.get("network") or "S").upper().split(",") if c in ("S", "O")] or ["S"]
+    ll.search_network = ",".join(net)
     ll.pending_search = True
-    ll.save(update_fields=["pending_search", "target_count"])
+    ll.save(update_fields=["pending_search", "target_count", "search_network"])
     importer.log_event(ll, "user", prompt)
     importer.log_event(ll, "system", f"Target set to {ll.target_count} leads. The worker will start finding them shortly.")
     return JsonResponse({"ok": True, "queued": True, "list_id": ll.pk})
