@@ -83,7 +83,9 @@ STATIC_ROOT = ROOT_DIR / "staticfiles"
 MEDIA_URL = "/media/"
 MEDIA_ROOT = ROOT_DIR / "media"
 
-LOGIN_URL = "/admin/login/"
+LOGIN_URL = "/login/"
+LOGIN_REDIRECT_URL = "/dashboard/"
+LOGOUT_REDIRECT_URL = "/"
 
 DEFAULT_FROM_EMAIL = "noreply@localhost"
 EMAIL_SUBJECT_PREFIX = "CRM: "

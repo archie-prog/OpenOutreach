@@ -139,7 +139,10 @@
   </style>
 </head>
 <body>
-  <header>OpenOutreach — Grantgunner</header>
+  <header style="display:flex;align-items:center;justify-content:space-between">
+    <span>{{ workspace_name|default:"Grantgunner" }}</span>
+    <a href="/logout/" style="font-size:13px;font-weight:400;color:#cbd5e1;text-decoration:none">Sign out</a>
+  </header>
   <nav id="nav"></nav>
   <div id="toasts"></div>
   <div class="wrap">
@@ -332,6 +335,51 @@
         <div><button id="ctxbtn" onclick="saveContext()">Save context</button> <span id="ctxsaved" class="hint"></span></div>
       </div>
     </div>
+
+    <div class="tab" id="tab-settings">
+      <h2>Workspace</h2>
+      <div class="editor" style="max-width:780px">
+        <p class="hint">Your workspace name appears across the app and on the sign-in page.</p>
+        <label>Workspace name</label><input id="set_ws" placeholder="Grantgunner">
+        <label>Signed in as</label><input id="set_login" disabled>
+        <div><button onclick="saveSettings()">Save workspace</button> <span id="set_saved" class="hint"></span></div>
+      </div>
+
+      <h2>Plan &amp; billing</h2>
+      <div class="editor" style="max-width:780px">
+        <div id="billcard" class="card" style="margin:0 0 14px">
+          <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+            <div>
+              <div style="font-size:13px;color:#6b7280">Current plan</div>
+              <div style="font-size:22px;font-weight:700" id="bill_plan">—</div>
+              <div class="hint" id="bill_status"></div>
+            </div>
+            <div id="bill_action"></div>
+          </div>
+          <div style="margin-top:14px;display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px" id="bill_usage"></div>
+        </div>
+        <p class="hint">Self-hosted today — your own server, your own AI key, no per-seat fee. To take payments from clients, connect Stripe: paste your <b>Stripe customer portal URL</b> below and the “Manage subscription” button will deep-link to it. (Full in-app checkout is a roadmap item.)</p>
+        <label>Billing email</label><input id="set_billemail" placeholder="billing@yourcompany.com">
+        <label>Stripe customer portal URL <span class="hint">(optional)</span></label><input id="set_portal" placeholder="https://billing.stripe.com/p/login/…">
+        <div><button onclick="saveSettings()">Save billing</button> <span id="bill_saved" class="hint"></span></div>
+      </div>
+    </div>
+
+    <div class="tab" id="tab-guide">
+      <h2>How {{ workspace_name|default:"Grantgunner" }} works</h2>
+      <div id="guide_overview" class="kpis" style="margin-bottom:18px"></div>
+      <div class="editor" style="max-width:880px">
+        <ol style="line-height:1.7;padding-left:20px">
+          <li><b>Connect a LinkedIn account</b> — <a href="#" onclick="gotoTab('accounts');return false">Accounts</a> tab → add the email + password. If the account uses 2FA, paste its <b>TOTP secret</b> so the worker can sign in unattended. Set per-account daily caps and a send window (we recommend ≤ 30 connects/day).</li>
+          <li><b>Tell the AI what you sell</b> — <a href="#" onclick="gotoTab('context');return false">AI Context</a> tab → add your API key and a clear description of your offer and ideal lead. This powers lead scoring, AI search and message personalisation.</li>
+          <li><b>Build a sequence</b> — <a href="#" onclick="gotoTab('flows');return false">Flows</a> tab → a branching playbook: connect → wait → message → InMail. The <b>accepted</b> branch runs when they connect; a <b>reply always stops</b> the sequence. Use <code>{first_name}</code>, <code>{company}</code> etc. to personalise.</li>
+          <li><b>Add leads</b> — <a href="#" onclick="gotoTab('leads');return false">Leads</a> tab → import a CSV, paste a LinkedIn search, or describe your ideal lead and let the AI find them. Each list fills toward a target you set.</li>
+          <li><b>Launch a campaign</b> — <a href="#" onclick="gotoTab('campaigns');return false">Campaigns</a> tab → pick a sequence + a lead list and activate. Each person is contacted at most once across all campaigns. Pause/resume any time.</li>
+          <li><b>Watch &amp; reply</b> — the <a href="#" onclick="gotoTab('dashboard');return false">Dashboard</a> shows connections, acceptances, messages and replies over time. Replies land in the <a href="#" onclick="gotoTab('unibox');return false">Unibox</a> — reply by hand, and turn on Slack pings in AI Context so you never miss one.</li>
+        </ol>
+        <p class="hint" style="margin-top:18px">⚖️ <b>Use responsibly.</b> Keep volumes human, only contact people relevant to your offer, and stay within LinkedIn's terms. The daily caps, randomisation and send windows exist to protect your account — don't crank them past what a person could plausibly do.</p>
+      </div>
+    </div>
   </div>
 
   <div class="modal-bg" id="chatbg" onclick="if(event.target===this)closeChat()">
@@ -405,7 +453,7 @@
     window.addEventListener("unhandledrejection", (e) => {
       if (e.reason && /^(auth|non-json|http )/.test(String(e.reason.message || ""))) e.preventDefault();
     });
-    const TABS = [["dashboard","Dashboard"],["flows","Flows"],["unibox","Unibox"],["accounts","Accounts"],["leads","Leads"],["campaigns","Campaigns"],["context","AI Context"]];
+    const TABS = [["dashboard","Dashboard"],["flows","Flows"],["unibox","Unibox"],["accounts","Accounts"],["leads","Leads"],["campaigns","Campaigns"],["context","AI Context"],["settings","Settings"],["guide","Guide"]];
     const nav = document.getElementById("nav");
     TABS.forEach(([id, label], i) => { const b = document.createElement("button"); b.textContent = label; b.className = i===0?"active":""; b.onclick = () => showTab(id, b); nav.appendChild(b); });
     function showTab(id, btn) {
@@ -418,6 +466,8 @@
       if (id === "context") { loadContext(); loadAiConfig(); }
       if (id === "campaigns") loadCampaigns();
       if (id === "accounts") loadAccounts();
+      if (id === "settings") loadSettings();
+      if (id === "guide") loadGuide();
       // The placeholder helper button is only relevant while editing a flow.
       document.getElementById("phelp-btn").style.display = (id === "flows") ? "block" : "none";
       if (id !== "flows") document.getElementById("phelp-panel").classList.remove("open");
@@ -638,6 +688,51 @@
       j("api/context/save/", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ai_context})})
         .then(r => { document.getElementById("ctxsaved").textContent = r.ok ? "Saved ✓ — leads will be (re)scored by the worker." : "save failed"; });
     };
+
+    // ---------- Settings (workspace + billing) ----------
+    function gotoTab(id){
+      const i = TABS.findIndex(t => t[0] === id);
+      const btns = document.querySelectorAll("#nav button");
+      if (i >= 0 && btns[i]) btns[i].click();
+    }
+    function loadSettings(){
+      j("api/settings/").then(d => {
+        document.getElementById("set_ws").value = d.workspace_name || "";
+        document.getElementById("set_login").value = d.login_email || "";
+        document.getElementById("set_billemail").value = d.billing_email || "";
+        document.getElementById("set_portal").value = d.portal_url || "";
+        document.getElementById("bill_plan").textContent = d.plan || "self-hosted";
+        document.getElementById("bill_status").textContent = "Status: " + (d.billing_status || "active")
+          + (d.billing_connected ? " · Stripe connected" : " · self-hosted (no billing connected)");
+        document.getElementById("bill_action").innerHTML = d.portal_url
+          ? `<a href="${esc(d.portal_url)}" target="_blank" style="text-decoration:none"><button>Manage subscription ↗</button></a>`
+          : `<span class="hint">Connect Stripe below to enable</span>`;
+      });
+      j("api/overview/").then(o => {
+        document.getElementById("bill_usage").innerHTML = [
+          ["Active accounts", o.accounts_active + " / " + o.accounts],
+          ["Accounts with 2FA", o.accounts_with_2fa],
+          ["Active campaigns", o.campaigns_active],
+          ["Connects this month", o.connects_this_month],
+          ["Messages this month", o.messages_this_month],
+        ].map(([l,v]) => `<div class="kpi"><div class="label">${l}</div><div class="value">${v}</div></div>`).join("");
+      });
+    }
+    window.saveSettings = () => {
+      j("api/settings/save/", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({
+        workspace_name: gv("set_ws"), billing_email: gv("set_billemail"), stripe_portal_url: gv("set_portal"),
+      })}).then(r => { if(r.ok){ toast("Settings saved", "ok"); loadSettings(); } });
+    };
+    function loadGuide(){
+      j("api/overview/").then(o => {
+        document.getElementById("guide_overview").innerHTML = [
+          ["Accounts", o.accounts_active + " / " + o.accounts + " active"],
+          ["2FA-protected", o.accounts_with_2fa],
+          ["Active campaigns", o.campaigns_active],
+          ["Lead lists", o.lead_lists],
+        ].map(([l,v]) => `<div class="kpi"><div class="label">${l}</div><div class="value">${v}</div></div>`).join("");
+      });
+    }
 
     // ---------- AI settings (provider + API key) ----------
     function loadAiConfig(){

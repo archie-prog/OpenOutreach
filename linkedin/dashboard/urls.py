@@ -44,4 +44,7 @@ urlpatterns = [
     path("api/inbox/accounts/", views.api_inbox_accounts, name="dashboard_api_inbox_accounts"),
     path("api/inbox/threads/", views.api_inbox_threads, name="dashboard_api_inbox_threads"),
     path("api/inbox/thread/<int:thread_id>/", views.api_inbox_thread, name="dashboard_api_inbox_thread"),
+    path("api/settings/", views.api_settings, name="dashboard_api_settings"),
+    path("api/settings/save/", views.api_settings_save, name="dashboard_api_settings_save"),
+    path("api/overview/", views.api_overview, name="dashboard_api_overview"),
 ]

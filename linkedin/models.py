@@ -52,6 +52,17 @@ class SiteConfig(models.Model):
     # Incoming Webhook URL for a LinkedIn channel. Pinged when a lead replies.
     slack_webhook_url = models.CharField(max_length=500, blank=True, default="")
     slack_notify_replies = models.BooleanField(default=True)
+    # ── Workspace + billing (commercial) ──────────────────────────────────
+    # Branding/identity for the workspace shown across the app.
+    workspace_name = models.CharField(max_length=120, blank=True, default="Grantgunner")
+    billing_email = models.CharField(max_length=200, blank=True, default="")
+    # Plan + billing state. Stripe-ready: when stripe_customer_id is set the
+    # Settings page can deep-link to the Stripe customer portal to manage the
+    # subscription; until then billing shows as "self-hosted / not connected".
+    plan = models.CharField(max_length=40, blank=True, default="self-hosted")
+    billing_status = models.CharField(max_length=40, blank=True, default="active")
+    stripe_customer_id = models.CharField(max_length=120, blank=True, default="")
+    stripe_portal_url = models.CharField(max_length=500, blank=True, default="")
 
     class Meta:
         app_label = "linkedin"

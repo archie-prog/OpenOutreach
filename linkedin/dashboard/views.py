@@ -18,13 +18,29 @@ from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_POST
 
 
+def welcome_page(request):
+    """Public landing/welcome page. Authenticated staff get a 'Go to dashboard'
+    CTA; everyone else gets 'Sign in'. This is the commercial front door."""
+    from linkedin.models import SiteConfig
+
+    cfg = SiteConfig.load()
+    return render(request, "welcome.html", {
+        "workspace_name": cfg.workspace_name or "Grantgunner",
+        "authed": request.user.is_authenticated and request.user.is_staff,
+    })
+
+
 @ensure_csrf_cookie
-@staff_member_required
+@staff_member_required(login_url="/login/")
 def dashboard_page(request):
     # ensure_csrf_cookie guarantees the csrftoken cookie is set so the page's
     # fetch helper can send it back as X-CSRFToken on mutating requests — the
     # mutating endpoints enforce CSRF (no more blanket @csrf_exempt).
-    return render(request, "dashboard/dashboard.html", {})
+    from linkedin.models import SiteConfig
+
+    return render(request, "dashboard/dashboard.html", {
+        "workspace_name": SiteConfig.load().workspace_name or "Grantgunner",
+    })
 
 
 @staff_member_required
@@ -154,6 +170,69 @@ def api_ai_config_save(request):
         cfg.slack_notify_replies = bool(payload["slack_notify_replies"])
     cfg.save()
     return JsonResponse({"ok": True})
+
+
+@staff_member_required
+def api_settings(request):
+    """Workspace + billing settings for the Settings tab."""
+    from linkedin.models import SiteConfig
+
+    cfg = SiteConfig.load()
+    connected = bool(cfg.stripe_customer_id or cfg.stripe_portal_url)
+    return JsonResponse({
+        "workspace_name": cfg.workspace_name or "Grantgunner",
+        "billing_email": cfg.billing_email,
+        "plan": cfg.plan or "self-hosted",
+        "billing_status": cfg.billing_status or "active",
+        "billing_connected": connected,
+        "portal_url": cfg.stripe_portal_url,
+        "login_email": request.user.email or request.user.username,
+    })
+
+
+@staff_member_required
+@require_POST
+def api_settings_save(request):
+    from linkedin.models import SiteConfig
+
+    payload = json.loads(request.body or "{}")
+    cfg = SiteConfig.load()
+    if "workspace_name" in payload:
+        cfg.workspace_name = (payload.get("workspace_name") or "Grantgunner").strip()[:120]
+    if "billing_email" in payload:
+        cfg.billing_email = (payload.get("billing_email") or "").strip()[:200]
+    # Stripe wiring (optional): paste a customer id / portal URL to enable the
+    # "Manage subscription" deep-link. Left blank = self-hosted, no billing.
+    if "stripe_customer_id" in payload:
+        cfg.stripe_customer_id = (payload.get("stripe_customer_id") or "").strip()[:120]
+    if "stripe_portal_url" in payload:
+        cfg.stripe_portal_url = (payload.get("stripe_portal_url") or "").strip()[:500]
+    cfg.save()
+    return JsonResponse({"ok": True})
+
+
+@staff_member_required
+def api_overview(request):
+    """At-a-glance counts for the Guide/Settings tabs: accounts, campaigns,
+    leads, this-month usage — so the user can see the system is wired up."""
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    from linkedin.models import ActionLog, Campaign, LeadList, LinkedInProfile
+
+    now = timezone.now()
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    accounts = LinkedInProfile.objects.all()
+    return JsonResponse({
+        "accounts": accounts.count(),
+        "accounts_active": accounts.filter(active=True).count(),
+        "accounts_with_2fa": accounts.exclude(totp_secret="").count(),
+        "campaigns_active": Campaign.objects.filter(status=Campaign.Status.ACTIVE, sequence__isnull=False).count(),
+        "lead_lists": LeadList.objects.filter(archived_at__isnull=True).count(),
+        "connects_this_month": ActionLog.objects.filter(action_type="connect", created_at__gte=month_start).count(),
+        "messages_this_month": ActionLog.objects.filter(action_type="message", created_at__gte=month_start).count(),
+    })
 
 
 @staff_member_required
