@@ -452,6 +452,9 @@ class MessageThread(models.Model):
     # account's pre-existing LinkedIn conversations from other tools.
     contacted_by_tool = models.BooleanField(default=False)
     read_at = models.DateTimeField(null=True, blank=True)  # null = unread (M5)
+    # Manually archived from the Unibox — hidden from the default thread list (e.g.
+    # an old conversation from a previous campaign on the same LinkedIn account).
+    archived_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(default=timezone.now)
 
     class Meta:

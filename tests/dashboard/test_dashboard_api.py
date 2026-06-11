@@ -177,3 +177,56 @@ class TestDashboardApi:
         )
         step.refresh_from_db()
         assert step.config["template"] == "Hi {first_name}!"
+
+
+@pytest.mark.django_db
+class TestUniboxArchive:
+    def _thread(self):
+        from crm.models import Lead
+        from linkedin.models import Message, MessageThread
+
+        prof = _profile()
+        lead = Lead.objects.create(linkedin_url="https://www.linkedin.com/in/z/", public_identifier="z")
+        thread = MessageThread.objects.create(lead=lead, account=prof, contacted_by_tool=True)
+        Message.objects.create(thread=thread, direction="out", linkedin_message_id="m1", sent_via_tool=True)
+        return thread
+
+    def _ids(self, admin_client, f):
+        return [t["id"] for t in admin_client.get(f"/dashboard/api/inbox/threads/?filter={f}").json()["threads"]]
+
+    def test_archive_hides_then_unarchive_restores(self, admin_client):
+        import json
+
+        t = self._thread()
+        # Visible by default.
+        assert t.pk in self._ids(admin_client, "all")
+        assert t.pk not in self._ids(admin_client, "archived")
+
+        # Archive it.
+        r = admin_client.post(
+            f"/dashboard/api/inbox/thread/{t.pk}/archive/",
+            data=json.dumps({"archived": True}), content_type="application/json",
+        ).json()
+        assert r["ok"] and r["archived"] is True
+        t.refresh_from_db()
+        assert t.archived_at is not None
+        # Gone from the default list, present in the archived view.
+        assert t.pk not in self._ids(admin_client, "all")
+        assert t.pk in self._ids(admin_client, "archived")
+
+        # Unarchive.
+        r2 = admin_client.post(
+            f"/dashboard/api/inbox/thread/{t.pk}/archive/",
+            data=json.dumps({"archived": False}), content_type="application/json",
+        ).json()
+        assert r2["archived"] is False
+        assert t.pk in self._ids(admin_client, "all")
+
+    def test_archive_missing_thread_404s(self, admin_client):
+        import json
+
+        r = admin_client.post(
+            "/dashboard/api/inbox/thread/999999/archive/",
+            data=json.dumps({"archived": True}), content_type="application/json",
+        )
+        assert r.status_code == 404

@@ -760,6 +760,11 @@ def api_inbox_threads(request):
     # Only threads THIS tool actually started — never the account's pre-existing
     # LinkedIn conversations from other tools.
     base = MessageThread.objects.filter(contacted_by_tool=True, messages__isnull=False)
+    # Archived threads are hidden everywhere except the dedicated "archived" view.
+    if f == "archived":
+        base = base.filter(archived_at__isnull=False)
+    else:
+        base = base.filter(archived_at__isnull=True)
     if f == "replied":
         base = base.filter(messages__direction="in")
     elif f == "sent":
@@ -789,6 +794,7 @@ def api_inbox_threads(request):
             "last_direction": last.direction if last else "",
             "unread": t.read_at is None,
             "has_reply": t.has_inbound_reply,
+            "archived": t.archived_at is not None,
         })
     return JsonResponse({"threads": threads})
 
@@ -822,8 +828,29 @@ def api_inbox_thread(request, thread_id):
         "lead_name": _lead_name(t.lead),
         "lead_url": t.lead.linkedin_url,
         "account_name": t.account.linkedin_username if t.account else "",
+        "archived": t.archived_at is not None,
         "messages": msgs,
     })
+
+
+@staff_member_required
+@require_POST
+def api_inbox_archive(request, thread_id):
+    """Archive (hide) or unarchive a Unibox conversation. Soft — the thread and
+    its messages are kept; archived threads just drop out of the default list.
+    Body: {"archived": true|false}; defaults to archiving."""
+    from django.utils import timezone
+
+    from linkedin.models import MessageThread
+
+    t = MessageThread.objects.filter(pk=thread_id).first()
+    if not t:
+        return JsonResponse({"error": "not found"}, status=404)
+    payload = json.loads(request.body or "{}")
+    archive = payload.get("archived", True)
+    t.archived_at = timezone.now() if archive else None
+    t.save(update_fields=["archived_at"])
+    return JsonResponse({"ok": True, "archived": t.archived_at is not None})
 
 
 @staff_member_required

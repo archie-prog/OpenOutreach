@@ -189,7 +189,7 @@
     </div>
 
     <div class="tab" id="tab-unibox">
-      <div class="bar"><b>Unibox</b> &nbsp; <label>Account:</label> <select id="inboxacct"><option value="">All accounts</option></select> &nbsp; <label>Campaign:</label> <select id="inboxcamp"><option value="">All campaigns</option></select> &nbsp; <label>Lead list:</label> <select id="inboxlist"><option value="">All lists</option></select> &nbsp; <label>Show:</label> <select id="inboxfilter"><option value="replied">Replied</option><option value="sent">Sent (no reply yet)</option><option value="all">All conversations</option></select></div>
+      <div class="bar"><b>Unibox</b> &nbsp; <label>Account:</label> <select id="inboxacct"><option value="">All accounts</option></select> &nbsp; <label>Campaign:</label> <select id="inboxcamp"><option value="">All campaigns</option></select> &nbsp; <label>Lead list:</label> <select id="inboxlist"><option value="">All lists</option></select> &nbsp; <label>Show:</label> <select id="inboxfilter"><option value="replied">Replied</option><option value="sent">Sent (no reply yet)</option><option value="all">All conversations</option><option value="archived">Archived</option></select></div>
       <div class="inbox">
         <div class="threadlist" id="threadlist"></div>
         <div class="convo" id="convo"><div class="hint" style="padding:24px">Select a conversation…</div></div>
@@ -841,9 +841,13 @@
     window.openThread = (id) => {
       CUR_THREAD = id;
       j(`api/inbox/thread/${id}/`).then(t => {
+        const archiveBtn = t.archived
+          ? `<a href="#" onclick="archiveThread(${id}, false);return false" style="font-size:12px;font-weight:400;margin-left:10px;color:#2563eb">↩ Unarchive</a>`
+          : `<a href="#" onclick="archiveThread(${id}, true);return false" style="font-size:12px;font-weight:400;margin-left:10px;color:#6b7280">🗄 Archive</a>`;
         document.getElementById("convo").innerHTML =
           `<div class="convohead">${esc(t.lead_name)} <span class="acctbadge">via ${esc(t.account_name)}</span>` +
-          (t.lead_url ? ` <a href="${esc(t.lead_url)}" target="_blank" style="font-size:12px;font-weight:400;margin-left:8px">↗ View on LinkedIn</a>` : "") + `</div>` +
+          (t.lead_url ? ` <a href="${esc(t.lead_url)}" target="_blank" style="font-size:12px;font-weight:400;margin-left:8px">↗ View on LinkedIn</a>` : "") +
+          archiveBtn + `</div>` +
           t.messages.map(m => {
             const who = m.direction==="out" ? ("You ("+esc(t.account_name)+")") : esc(t.lead_name);
             const stateCls = m.pending ? "pending" : (m.failed ? "failed" : "");
@@ -854,6 +858,16 @@
           `<div style="margin-top:14px;display:flex;gap:8px"><input id="composebox" placeholder="Type a reply, sent from ${esc(t.account_name)}…" style="flex:1" onkeydown="if(event.key==='Enter')sendMsg(${id})"><button onclick="sendMsg(${id})" style="background:#2563eb;color:#fff;border:none;border-radius:6px;padding:7px 16px;cursor:pointer">Send</button></div>`;
         loadThreads();
       });
+    };
+    window.archiveThread = (id, archived) => {
+      j(`api/inbox/thread/${id}/archive/`, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({archived})})
+        .then(r => {
+          if (!r.ok) return;
+          toast(archived ? "Conversation archived" : "Conversation unarchived", "ok");
+          // If we just archived the open thread, clear the convo pane; refresh the list.
+          if (archived && CUR_THREAD === id) { document.getElementById("convo").innerHTML = `<div class="hint" style="padding:16px">Select a conversation.</div>`; CUR_THREAD = null; }
+          loadThreads();
+        });
     };
     window.sendMsg = (id) => {
       const box = document.getElementById("composebox"); const body = (box.value||"").trim();
