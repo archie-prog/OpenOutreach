@@ -75,6 +75,7 @@ class TestInmailInSequence:
 
         with patch.multiple(
             executor,
+            connection_status=lambda *a, **k: "not_connected",
             send_connection_request=lambda *a, **k: None,
             is_connection_accepted=lambda *a, **k: False,
         ):

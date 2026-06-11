@@ -272,6 +272,8 @@
           <div style="flex:1"><label>Lead list (optional — add more later)</label><select id="nc_list"></select></div>
         </div>
         <label style="display:inline"><input type="checkbox" id="nc_active" checked> Launch active now (start contacting)</label>
+        <label style="display:block;margin-top:8px"><input type="checkbox" id="nc_inclnet"> <b>Include current network</b> — also contact people already connected on this account</label>
+        <div class="hint" style="margin-top:2px">⚠️ Leave OFF (recommended). When OFF, the kit only messages people whose connection <b>it</b> made — it skips anyone you're already connected to or have contacted before. Turn ON <b>only</b> if this lead list is intentionally your existing contacts.</div>
         <div><button onclick="createCampaign()">Create campaign</button></div>
         <div class="hint">A campaign runs its sequence over the leads you add. Pause anytime — it stops mid-flow and resumes where it left off.</div>
       </div>
@@ -287,7 +289,7 @@
 
         <h3>Leads</h3>
         <div class="bar">
-          <label>State:</label> <select id="campstate"><option value="">All</option><option value="active">Active</option><option value="completed">Completed</option><option value="stopped_reply">Replied</option><option value="paused_manual">Paused</option><option value="archived">Archived</option></select>
+          <label>State:</label> <select id="campstate"><option value="">All</option><option value="active">Active</option><option value="completed">Completed</option><option value="stopped_reply">Replied</option><option value="paused_manual">Paused</option><option value="skipped_existing">Skipped — existing connection</option><option value="archived">Archived</option></select>
         </div>
         <table id="campleads"><thead><tr>
           <th onclick="sortCamp('lead_name')">Lead ▾</th><th onclick="sortCamp('title')">Title</th>
@@ -621,10 +623,15 @@
       const sequence_id = gv("nc_seq");
       const lead_list_id = gv("nc_list") || null;
       const status = document.getElementById("nc_active").checked ? "active" : "draft";
-      if (!name) { alert("Name the campaign"); return; }
-      if (!sequence_id) { alert("Pick a sequence"); return; }
-      j("api/campaigns/create/", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({name, sequence_id, lead_list_id, status})})
-        .then(r => { if(r.ok){ document.getElementById("nc_name").value=""; alert(`Campaign created${r.enrolled?` — ${r.enrolled} leads enrolled`:""}.`); loadCampaigns(); } else alert(r.error||"failed"); });
+      const include_current_network = document.getElementById("nc_inclnet").checked;
+      if (!name) { toast("Name the campaign", "err"); return; }
+      if (!sequence_id) { toast("Pick a sequence", "err"); return; }
+      j("api/campaigns/create/", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({name, sequence_id, lead_list_id, status, include_current_network})})
+        .then(r => { if(r.ok){ document.getElementById("nc_name").value=""; document.getElementById("nc_inclnet").checked=false; toast(`Campaign created${r.enrolled?` — ${r.enrolled} leads enrolled`:""}.`, "ok"); loadCampaigns(); } });
+    };
+    window.setInclNet = (id, on) => {
+      j(`api/campaign/${id}/update/`, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({include_current_network: on})})
+        .then(r => { if(r.ok) toast(on ? "Now including current network — existing connections CAN be contacted" : "Existing network excluded — only kit-made connections will be messaged", "ok"); });
     };
     window.setCampStatus = (id, status) => {
       if (status === "archived" && !confirm("Archive this campaign? It stops contacting and is hidden (not deleted).")) return;
@@ -648,14 +655,17 @@
       document.getElementById("campstate").onchange = renderCampLeads;
       // Overview + stats + activity + responses
       j(`api/campaign/${id}/detail/`).then(d => {
-        document.getElementById("cd-title").innerHTML = `${d.name} <span class="pill ${d.status}">${STATUS_LABEL[d.status]||d.status}</span>`;
-        document.getElementById("cd-meta").textContent = `Sequence: ${d.sequence||"—"}  ·  Primary lead list: ${d.lead_list||"—"}`;
+        document.getElementById("cd-title").innerHTML = `${esc(d.name)} <span class="pill ${d.status}">${STATUS_LABEL[d.status]||d.status}</span>`;
+        document.getElementById("cd-meta").innerHTML = `Sequence: ${esc(d.sequence||"—")}  ·  Primary lead list: ${esc(d.lead_list||"—")}`
+          + `<div style="margin-top:8px"><label style="display:inline;font-size:13px"><input type="checkbox" id="cd_inclnet" ${d.include_current_network?"checked":""} onchange="setInclNet(${d.id}, this.checked)"> Include current network (contact people already connected)</label>`
+          + ` <span class="hint">— ${d.include_current_network ? "ON: existing connections can be messaged" : "OFF: only connections the kit made are messaged; existing/already-contacted people are skipped"}</span></div>`;
         const S = d.stats;
         const tiles = [
           ["Connections sent",S.connections],["Connections accepted",S.accepted],
           ["Messages sent",S.messages],["Posts liked",S.posts_liked],
           ["InMails — to non-accepters",S.inmails],["Replies",S.replies],
           ["Active",S.active],["Completed",S.completed],
+          ["Skipped — existing",S.skipped_existing||0],
         ];
         document.getElementById("cd-stats").innerHTML = tiles.map(([l,v]) => `<div class="kpi"><div class="label">${l}</div><div class="value">${v}</div></div>`).join("");
         document.getElementById("cd-responses").innerHTML = d.responses.length

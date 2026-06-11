@@ -105,6 +105,12 @@ class Campaign(models.Model):
         on_delete=models.SET_NULL, related_name="campaigns",
     )
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
+    # Safety default OFF: the kit only acts on people whose connection IT made
+    # (its connect request was accepted). Turn ON to deliberately contact people
+    # already in the account's network — only do this when the lead list is an
+    # intentional list of existing contacts (you accept they may have been
+    # messaged before). See the connection-provenance guard in sequences/executor.
+    include_current_network = models.BooleanField(default=False)
 
     def __str__(self):
         return self.name
@@ -408,6 +414,10 @@ class LeadCampaignState(models.Model):
         STOPPED_REPLY = "stopped_reply", "Stopped — replied"
         STOPPED_ERROR = "stopped_error", "Stopped — error"
         PAUSED_MANUAL = "paused_manual", "Paused (manual)"
+        # Excluded because the person was already a connection (or had a pending
+        # request) that this kit didn't create — and the campaign isn't set to
+        # include the existing network. No outreach was sent.
+        SKIPPED_EXISTING = "skipped_existing", "Skipped — existing connection"
         ARCHIVED = "archived", "Archived"
 
     lead = models.ForeignKey("crm.Lead", on_delete=models.CASCADE, related_name="campaign_states")
@@ -421,6 +431,10 @@ class LeadCampaignState(models.Model):
     state = models.CharField(max_length=20, choices=State.choices, default=State.ACTIVE)
     # True while a connect step waits to learn if the request was accepted.
     awaiting_decision = models.BooleanField(default=False)
+    # True once this person became a connection because THIS kit's connection
+    # request was accepted. Gates messaging: by default the kit only messages
+    # people whose connection it made itself (see Campaign.include_current_network).
+    connected_via_tool = models.BooleanField(default=False)
     next_action_due_at = models.DateTimeField(null=True, blank=True, db_index=True)
     last_action_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(default=timezone.now)

@@ -103,6 +103,7 @@ def test_awaiting_decision_persisted_false_after_decision(fake_session):
 
     with patch.multiple(
         executor,
+        connection_status=lambda *a, **k: "not_connected",
         send_connection_request=lambda *a, **k: None,
         is_connection_accepted=lambda *a, **k: True,
         send_message=lambda *a, **k: None,
@@ -148,3 +149,96 @@ def test_due_states_skips_non_active_campaign(fake_session):
     with patch.multiple(executor, send_connection_request=_count, is_connection_accepted=lambda *a, **k: False):
         executor.run_due_states(fake_session, campaign=campaign)
     assert sent["n"] == 0  # paused campaign must not send
+
+
+# ── Connection-provenance guard: only act on kit-made connections ──
+
+
+def _enroll_one(fake_session, *, include_current_network=False):
+    """A connect→message campaign with one enrolled lead. Returns (campaign, state)."""
+    from crm.models import Lead
+    from linkedin.models import Campaign, LeadCampaignState, LeadList
+    from linkedin.sequences import executor
+
+    owner = fake_session.django_user
+    seq = _connect_then_message(owner)
+    ll = LeadList.objects.create(name="L", owner=owner, source_type=LeadList.SourceType.CSV)
+    Lead.objects.create(linkedin_url="https://www.linkedin.com/in/p/", public_identifier="p", lead_list=ll)
+    campaign = Campaign.objects.create(
+        name="Prov", sequence=seq, lead_list=ll, status=Campaign.Status.ACTIVE,
+        include_current_network=include_current_network,
+    )
+    campaign.users.add(owner)
+    executor.enroll_campaign(campaign)
+    return campaign, LeadCampaignState.objects.get(campaign=campaign)
+
+
+def _drive_n(executor, fake_session, campaign, rounds=6):
+    from linkedin.models import LeadCampaignState
+    for _ in range(rounds):
+        active = LeadCampaignState.objects.filter(campaign=campaign, state=LeadCampaignState.State.ACTIVE)
+        if not active.exists():
+            break
+        active.update(next_action_due_at=timezone.now())
+        executor.run_due_states(fake_session, campaign=campaign)
+
+
+@pytest.mark.django_db
+class TestProvenanceGuard:
+    def _connected(self):
+        from linkedin_cli.enums import ProfileState
+        return str(ProfileState.CONNECTED)
+
+    def test_preexisting_connection_skipped_when_toggle_off(self, fake_session):
+        from linkedin.models import ActionLog, LeadCampaignState
+        from linkedin.sequences import executor
+
+        campaign, state = _enroll_one(fake_session, include_current_network=False)
+        msgs = {"n": 0}
+        with patch.multiple(
+            executor,
+            connection_status=lambda *a, **k: self._connected(),  # already a connection
+            send_connection_request=lambda *a, **k: None,
+            send_message=lambda *a, **k: msgs.__setitem__("n", msgs["n"] + 1),
+        ):
+            _drive_n(executor, fake_session, campaign)
+        state.refresh_from_db()
+        assert state.state == LeadCampaignState.State.SKIPPED_EXISTING
+        assert msgs["n"] == 0  # never messaged
+        assert ActionLog.objects.filter(campaign=campaign, action_type="connect").count() == 0
+
+    def test_preexisting_connection_contacted_when_toggle_on(self, fake_session):
+        from linkedin.models import LeadCampaignState
+        from linkedin.sequences import executor
+
+        campaign, state = _enroll_one(fake_session, include_current_network=True)
+        msgs = {"n": 0}
+        with patch.multiple(
+            executor,
+            connection_status=lambda *a, **k: self._connected(),
+            send_connection_request=lambda *a, **k: None,
+            send_message=lambda *a, **k: msgs.__setitem__("n", msgs["n"] + 1),
+        ):
+            _drive_n(executor, fake_session, campaign)
+        state.refresh_from_db()
+        assert state.state == LeadCampaignState.State.COMPLETED
+        assert msgs["n"] == 1  # deliberately contacted the existing connection
+
+    def test_tool_made_connection_proceeds(self, fake_session):
+        from linkedin.models import LeadCampaignState
+        from linkedin.sequences import executor
+
+        campaign, state = _enroll_one(fake_session, include_current_network=False)
+        # Phase 1 status = not-connected (kit sends request); decision phase = connected.
+        seq = iter(["not_connected", self._connected()])
+        msgs = {"n": 0}
+        with patch.multiple(
+            executor,
+            connection_status=lambda *a, **k: next(seq),
+            send_connection_request=lambda *a, **k: None,
+            send_message=lambda *a, **k: msgs.__setitem__("n", msgs["n"] + 1),
+        ):
+            _drive_n(executor, fake_session, campaign)
+        state.refresh_from_db()
+        assert state.connected_via_tool is True
+        assert msgs["n"] == 1  # messaged after the kit's own connection was accepted

@@ -171,6 +171,17 @@ def advance_state(session, state) -> None:
     if step is None:
         _complete(state)
         return
+    # Connection-provenance guard at the MESSAGE stage: never directly message
+    # someone whose connection the kit didn't make itself (unless the campaign
+    # opts into the existing network). Checked before the cap/pacing gate so an
+    # excluded lead doesn't burn a send slot. (Connect runs its own status-aware
+    # guard inside _handle_connect; InMail targets non-connectors by design;
+    # profile-visit/like are warm-up signals that may legitimately precede a
+    # connect.) This is what stops the kit re-messaging existing connections /
+    # already-contacted people pulled in by the AI finder.
+    if step.step_type == SequenceStep.StepType.MESSAGE and not _may_message(state):
+        _skip_existing(state)
+        return
     # M6: defer when this account is at its daily cap for the step's action.
     action = _STEP_ACTION.get(step.step_type)
     consumes_cap = action and not (
@@ -207,7 +218,27 @@ def advance_state(session, state) -> None:
 
 
 def _handle_connect(session, state, step):
+    from linkedin_cli.enums import ProfileState
+
     if not state.awaiting_decision:
+        # ── Connection-provenance guard ──────────────────────────────────
+        # The kit only builds on connections IT makes. Check the live status
+        # BEFORE sending: if the person is ALREADY connected (or already has a
+        # request pending) — i.e. a connection this kit did not create — exclude
+        # them, unless the campaign deliberately includes the existing network.
+        status = connection_status(session, state)
+        preexisting = status in (str(ProfileState.CONNECTED), str(ProfileState.PENDING))
+        if preexisting and not state.campaign.include_current_network:
+            _skip_existing(state, status)
+            return
+        if status == str(ProfileState.CONNECTED):
+            # Already a connection AND the campaign opted into the existing network
+            # — there's no request to send; proceed straight down the accepted
+            # branch. (connected_via_tool stays False: this wasn't the kit's doing,
+            # it's an intentional existing-network contact.)
+            _goto(state, step.next_step(Branch.SUCCESS))
+            return
+        # NOT_CONNECTED (or PENDING with the toggle on) → send the kit's request.
         send_connection_request(session, state, step)
         _log(session, state, step, ActionLog.ActionType.CONNECT)
         wait_days = int(step.config.get("wait_days_before_branch_decision", DEFAULT_CONNECT_DECISION_DAYS))
@@ -222,8 +253,11 @@ def _handle_connect(session, state, step):
     # own fields, so without this the row stays awaiting_decision=True forever,
     # breaking any later connect step (it'd skip its send + cap gate).
     state.awaiting_decision = False
-    state.save(update_fields=["awaiting_decision"])
     if accepted:
+        # The kit's OWN connection request was accepted → this is a tool-made
+        # connection, so messaging is allowed downstream.
+        state.connected_via_tool = True
+        state.save(update_fields=["awaiting_decision", "connected_via_tool"])
         # Record the acceptance (a detected result of our outreach, not a capped
         # action) so the dashboard can report connections accepted.
         ActionLog.objects.create(
@@ -232,8 +266,27 @@ def _handle_connect(session, state, step):
             lead=state.lead,
             action_type=ActionLog.ActionType.CONNECT_ACCEPTED,
         )
+    else:
+        state.save(update_fields=["awaiting_decision"])
     branch = Branch.SUCCESS if accepted else Branch.FAILURE
     _goto(state, step.next_step(branch))
+
+
+def _may_message(state) -> bool:
+    """Messaging is only allowed when the kit made this connection itself, or the
+    campaign deliberately includes the existing network."""
+    return state.connected_via_tool or state.campaign.include_current_network
+
+
+def _skip_existing(state, status="") -> None:
+    """Exclude a lead the kit didn't connect itself — no outreach sent."""
+    state.state = LeadCampaignState.State.SKIPPED_EXISTING
+    state.next_action_due_at = None
+    state.save(update_fields=["state", "next_action_due_at"])
+    logger.info(
+        "Lead %s skipped — existing/non-tool connection (%s); enable 'include current "
+        "network' on the campaign to contact them deliberately.", state.lead_id, status or "preexisting",
+    )
 
 
 def _mark_contacted(session, state):
@@ -442,13 +495,21 @@ def send_connection_request(session, state, step):
     _send(session, pdict)
 
 
-def is_connection_accepted(session, state) -> bool:
+def connection_status(session, state) -> str:
+    """The lead's current connection status as a ProfileState string
+    (CONNECTED / PENDING / NOT_CONNECTED). The single mockable boundary the
+    provenance guard and acceptance check both read."""
     from linkedin_cli.actions.status import get_connection_status
-    from linkedin_cli.enums import ProfileState
 
     lead = state.lead
     pdict = {"public_identifier": lead.public_identifier, "url": lead.linkedin_url, "urn": lead.urn or ""}
-    return str(get_connection_status(session, pdict)) == str(ProfileState.CONNECTED)
+    return str(get_connection_status(session, pdict))
+
+
+def is_connection_accepted(session, state) -> bool:
+    from linkedin_cli.enums import ProfileState
+
+    return connection_status(session, state) == str(ProfileState.CONNECTED)
 
 
 def send_message(session, state, step):

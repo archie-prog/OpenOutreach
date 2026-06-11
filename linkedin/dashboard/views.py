@@ -533,6 +533,7 @@ def api_campaigns(request):
             "lead_list": c.lead_list.name if c.lead_list else "",
             "lead_list_id": c.lead_list_id,
             "leads": c.lead_states.count(),
+            "include_current_network": c.include_current_network,
         })
     return JsonResponse({"campaigns": out})
 
@@ -560,6 +561,7 @@ def api_campaign_create(request):
     try:
         campaign = Campaign.objects.create(
             name=name, sequence_id=sequence_id, lead_list_id=lead_list_id, status=status,
+            include_current_network=bool(payload.get("include_current_network")),
         )
     except IntegrityError:
         return JsonResponse({"error": "a campaign with that name already exists"}, status=400)
@@ -605,6 +607,8 @@ def api_campaign_update(request, campaign_id):
         campaign.sequence_id = payload["sequence_id"] or None; updates.append("sequence")
     if "lead_list_id" in payload:
         campaign.lead_list_id = payload["lead_list_id"] or None; updates.append("lead_list")
+    if "include_current_network" in payload:
+        campaign.include_current_network = bool(payload["include_current_network"]); updates.append("include_current_network")
 
     status = payload.get("status")
     enrolled = 0
@@ -724,10 +728,12 @@ def api_campaign_detail(request, campaign_id):
         "id": c.pk, "name": c.name, "status": c.status,
         "sequence": c.sequence.name if c.sequence else "",
         "lead_list": c.lead_list.name if c.lead_list else "",
+        "include_current_network": c.include_current_network,
         "stats": {
             "enrolled": sum(state_counts.values()),
             "active": state_counts.get("active", 0),
             "completed": state_counts.get("completed", 0),
+            "skipped_existing": state_counts.get("skipped_existing", 0),
             "connections": action_counts.get("connect", 0),
             "accepted": _accepted_count(c.pk),
             "messages": action_counts.get("message", 0),
