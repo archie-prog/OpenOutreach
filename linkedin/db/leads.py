@@ -22,7 +22,6 @@ def create_enriched_lead(session, url: str, profile: Dict[str, Any], lead_list=N
     """Create Lead with full profile data and embedding.
 
     Returns lead PK or None if exists.
-    Does NOT create Deal — that comes at qualification.
     ``lead_list`` optionally attaches the Lead to a manual-import LeadList.
     """
     from crm.models import Lead

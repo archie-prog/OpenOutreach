@@ -7,13 +7,12 @@ from django.urls import path, reverse
 from django.utils import timezone
 from django.utils.html import format_html
 
-from chat.models import ChatMessage
 from crm.models import Lead
 
 from linkedin.leads import importer
 from linkedin.models import (
     AccountDailyCounter, ActionLog, Campaign, LeadCampaignState, LeadList, LinkedInProfile,
-    Message, MessageThread, SearchKeyword, Sequence, SequenceStep, SiteConfig, Task,
+    Message, MessageThread, Sequence, SequenceStep, SiteConfig,
 )
 from linkedin.sequences import executor
 
@@ -280,13 +279,6 @@ class AccountDailyCounterAdmin(admin.ModelAdmin):
         return False
 
 
-@admin.register(SearchKeyword)
-class SearchKeywordAdmin(admin.ModelAdmin):
-    list_display = ("keyword", "campaign", "used", "used_at")
-    list_filter = ("used", "campaign")
-    raw_id_fields = ("campaign",)
-
-
 @admin.register(ActionLog)
 class ActionLogAdmin(admin.ModelAdmin):
     list_display = ("action_type", "linkedin_profile", "campaign", "created_at")
@@ -294,26 +286,6 @@ class ActionLogAdmin(admin.ModelAdmin):
     raw_id_fields = ("linkedin_profile", "campaign")
     date_hierarchy = "created_at"
     readonly_fields = ("linkedin_profile", "campaign", "action_type", "created_at")
-
-
-@admin.register(Task)
-class TaskAdmin(admin.ModelAdmin):
-    list_display = ("task_type", "status", "scheduled_at", "payload", "created_at")
-    list_filter = ("task_type", "status")
-    readonly_fields = (
-        "task_type", "status", "scheduled_at", "payload",
-        "created_at", "started_at", "completed_at",
-    )
-    date_hierarchy = "scheduled_at"
-
-
-@admin.register(ChatMessage)
-class ChatMessageAdmin(admin.ModelAdmin):
-    list_display = ("content_type", "object_id", "owner", "creation_date")
-    list_filter = ("content_type", "owner")
-    raw_id_fields = ("owner", "answer_to", "topic")
-    date_hierarchy = "creation_date"
-    readonly_fields = ("content_type", "object_id", "content", "owner", "creation_date")
 
 
 class EnrichmentStatusFilter(admin.SimpleListFilter):

@@ -23,10 +23,3 @@ class LeadFactory(factory.django.DjangoModelFactory):
     linkedin_url = factory.LazyAttribute(
         lambda o: f"https://www.linkedin.com/in/{o.public_identifier}/"
     )
-
-
-class DealFactory(factory.django.DjangoModelFactory):
-    class Meta:
-        model = "crm.Deal"
-
-    lead = factory.SubFactory(LeadFactory)
