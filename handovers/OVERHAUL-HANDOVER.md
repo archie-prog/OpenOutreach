@@ -11,10 +11,11 @@ This file tells you (a) exactly where things stand, (b) how to work on this syst
 
 ## 0. TL;DR — what to do next (in order)
 
-1. **Re-authenticate the LinkedIn account** (see §4 — this is the #1 live blocker; the
-   worker is stopped because its session 401s). Nothing in the campaign engine can run
-   until this is fixed. Best fix: set the account's **TOTP secret** in the dashboard
-   Accounts tab, then restart `oo-worker`.
+1. **Decide whether campaign 8 should be running** (see §4). The worker **self-healed** its
+   stale LinkedIn session and is **live again** — it will resume REAL outreach to ~296 investor
+   leads. Either let it run or **pause campaign 8** (Campaigns tab). Then make the recovery durable
+   by setting the account's **TOTP secret** in the Accounts tab (no TOTP stored today → the next
+   2FA challenge would break the unattended login).
 2. **Commit + deploy the commercial-pages work** if not already (see §2 — it's finished
    and verified in the mirror, may already be committed by the time you read this).
 3. **Drop the empty legacy tables** (task in §5.A) — Task, SearchKeyword, Deal,
@@ -191,30 +192,34 @@ ssh linkedinautomation@fedora-badlaptop 'cd ~/OpenOutreach && \
 
 ---
 
-## 4. ⚠️ CRITICAL live issue — the LinkedIn account is logged out
+## 4. ⚠️ Live status — the worker SELF-HEALED and is now sending (decide whether to pause)
 
-The worker was 401-ing **every cycle**: `AuthenticationError('Messaging API 401 (fetch_conversations)')`.
-The saved cookies for **`aawilding@gmail.com`** are stale/invalid. Consequences seen live:
-- **138 leads are already `stopped_error`** (the executor used to brick a lead on any transient
-  error — partly addressed, but the backlog is there).
-- Campaign **id 8** (`GrantGunner Investors - Marketing + Grantwriters`) is **active with ~296
-  leads** (158 active, 80 archived, 3 paused, 2 completed).
+History: the worker had been 401-ing **every cycle**
+(`AuthenticationError('Messaging API 401 (fetch_conversations)')`) — the saved cookies for
+**`aawilding@gmail.com`** had gone stale. **138 leads are `stopped_error`** from the accumulated
+failures (the executor bricks a lead on any transient error — see §6).
 
-**I STOPPED `oo-worker`** to avoid hammering logins on a real account (my new reauth hook would
-otherwise try a fresh login each cycle; the account has **no stored TOTP**, so an unattended login
-can't clear a 2FA/checkpoint). The web (`oo-web`) is still up.
+**Resolution (automatic):** the new throttled reauth hook in `run_worker.py` fired, called
+`session.reauthenticate()`, and LinkedIn **accepted the fresh username/password login** (no 2FA
+challenge was presented this time). As of the end of this pass the worker runs **clean cycles**
+(`cycle: executed=0 …`, no 401s) and `oo-web`/`oo-worker` are both **Up** (`restart=always`).
 
-**To recover (user-assisted):**
-1. Preferred — **set the account's TOTP secret**: in LinkedIn, add an authenticator app to
-   `aawilding@gmail.com`, copy the base32 secret, paste it in the dashboard **Accounts** tab (the
-   new TOTP field). Then `podman start oo-worker`. The rewritten login flow will sign in unattended.
-2. Or — **clear the checkpoint by hand**: `podman start oo-worker`, VNC into the worker's Xvfb
-   display, complete the LinkedIn login/checkpoint once; the cookies get saved and the worker proceeds.
-3. **Before un-pausing real outreach:** the live account should only message/connect-test the
-   **authorised contacts** — *Toby Claxton, Joshua Young, Jess McAllister*. Everyone else in campaign
-   8 is real outreach; consider pausing campaign 8 until the user confirms it should run.
-- Consider a follow-up: when reauth fails, the worker could auto-**pause** active campaigns + raise
-  a dashboard banner, instead of leaving leads to accumulate `stopped_error`.
+**→ This means the system is LIVE again.** Campaign **id 8**
+(`GrantGunner Investors - Marketing + Grantwriters`, **active, ~296 leads**: 158 active / 80 archived
+/ 3 paused / 2 completed) **will resume REAL outreach** to those leads as their `next_action_due_at`
+comes due. **Decide with the user whether to let it run or pause campaign 8** (dashboard Campaigns
+tab → Pause), given the rule: the live account should only message/connect the **authorised test
+contacts** — *Toby Claxton, Joshua Young, Jess McAllister* — when debugging; the rest of campaign 8
+is real investor outreach.
+
+**Make the recovery durable:** the auto-login worked once, but the account has **no stored TOTP** —
+if LinkedIn next presents a 2FA/checkpoint the unattended login will fail. Set the account's **TOTP
+secret** in the dashboard **Accounts** tab (add an authenticator app to `aawilding@gmail.com`, paste
+the base32 secret) so future re-auths are reliable. To clear a one-off checkpoint by hand, VNC into
+the worker's Xvfb (`podman port oo-worker`).
+
+**Suggested follow-up:** when reauth *fails*, have the worker auto-**pause** active campaigns + raise
+a dashboard banner, instead of letting leads pile up as `stopped_error`.
 
 ---
 
