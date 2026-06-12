@@ -718,6 +718,7 @@ def api_campaign_leads(request, campaign_id):
         if s.current_step and s.current_step.step_type == "connect" and s.awaiting_decision:
             stage = "connect (awaiting accept)"
         leads.append({
+            "id": s.lead_id,
             "lead_name": _lead_name(s.lead),
             "lead_url": s.lead.linkedin_url,
             "title": s.lead.title,
@@ -1409,3 +1410,59 @@ def api_sequence(request, sequence_id):
 
     root = seq.root_step
     return JsonResponse({"id": seq.pk, "name": seq.name, "root": node(root) if root else None})
+
+
+@staff_member_required
+def api_lead_history(request, lead_id):
+    """System-wide CRM log for one person: every interaction across ALL accounts
+    (connects, acceptances, likes, InMails, profile visits, sent messages, and
+    replies), labelled by account + campaign, newest first."""
+    from django.utils import timezone
+
+    from crm.models import Lead
+    from linkedin.models import ActionLog, Message
+
+    lead = Lead.objects.filter(pk=lead_id).first()
+    if not lead:
+        return JsonResponse({"error": "not found"}, status=404)
+
+    def disp(dt):
+        return timezone.localtime(dt).strftime("%-d %b %H:%M") if dt else ""
+
+    events = []
+    # Non-message actions/events (messages come from the Message rows below, to
+    # avoid double-counting a send that exists as both an ActionLog and a Message).
+    acts = ActionLog.objects.filter(
+        lead=lead,
+        action_type__in=["connect", "connect_accepted", "like_post", "inmail", "profile_visit"],
+    ).select_related("linkedin_profile", "campaign")
+    for a in acts:
+        events.append({
+            "kind": a.action_type,
+            "ts": a.created_at.isoformat(),
+            "at": disp(a.created_at),
+            "account": a.linkedin_profile.linkedin_username if a.linkedin_profile_id else "",
+            "campaign": a.campaign.name if a.campaign_id else "",
+            "body": "",
+            "url": a.target_url or "",
+        })
+    # Conversation (sent + received) across every account's thread with this lead.
+    for m in Message.objects.filter(thread__lead=lead).select_related("thread__account"):
+        when = m.sent_at or getattr(m, "fetched_at", None)
+        events.append({
+            "kind": "reply" if m.direction == "in" else "message_sent",
+            "ts": when.isoformat() if when else "",
+            "at": disp(when),
+            "account": m.thread.account.linkedin_username if m.thread.account_id else "",
+            "campaign": "",
+            "body": m.body or "",
+            "url": "",
+        })
+    events.sort(key=lambda e: e["ts"], reverse=True)
+    campaigns = sorted({c for c in lead.campaign_states.values_list("campaign__name", flat=True) if c})
+    return JsonResponse({
+        "lead_name": _lead_name(lead),
+        "lead_url": lead.linkedin_url,
+        "campaigns": campaigns,
+        "events": events,
+    })

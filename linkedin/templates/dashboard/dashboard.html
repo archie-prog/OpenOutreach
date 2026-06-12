@@ -304,6 +304,7 @@
           <th onclick="sortCamp('company')">Company</th><th onclick="sortCamp('ai_score')">AI score ▾</th>
           <th onclick="sortCamp('stage')">Stage</th><th onclick="sortCamp('state')">State</th><th></th>
         </tr></thead><tbody></tbody></table>
+        <div id="leadhist" style="display:none;margin-top:12px;border-top:1px solid #e5e7eb;padding-top:10px"></div>
         </div>
 
         <h3>Responses</h3>
@@ -742,11 +743,27 @@
       const rows = CAMP_LEADS.filter(l => !sf || l.state === sf);
       rows.sort((a,b) => { let x=a[CAMP_SORT], y=b[CAMP_SORT]; if(x==null)x=(CAMP_SORT==="ai_score"?-1:""); if(y==null)y=(CAMP_SORT==="ai_score"?-1:""); return (x<y?-1:x>y?1:0)*(CAMP_DESC?-1:1); });
       document.querySelector("#campleads tbody").innerHTML = rows.map(l => `<tr>
-        <td>${esc(l.lead_name)}</td><td>${esc((l.title||"").slice(0,45))}</td><td>${esc((l.company||"").slice(0,25))}</td>
+        <td><a href="#" onclick="openLeadHistory(${l.id});return false">${esc(l.lead_name)}</a></td><td>${esc((l.title||"").slice(0,45))}</td><td>${esc((l.company||"").slice(0,25))}</td>
         <td>${l.ai_score==null?"—":l.ai_score}</td><td>${esc(l.stage)}</td><td>${esc(l.state)}</td>
         <td><a href="${esc(l.lead_url)}" target="_blank">↗</a></td></tr>`).join("") || `<tr><td colspan="7">No leads in this campaign.</td></tr>`;
     }
 
+    window.openLeadHistory = (id) => {
+      const el = document.getElementById("leadhist");
+      el.style.display = "block";
+      el.innerHTML = `<div class="hint">Loading history…</div>`;
+      const LBL = {connect:"Connection request",connect_accepted:"Connection accepted",like_post:"Liked a post",inmail:"InMail",profile_visit:"Profile visit",message_sent:"Message sent",reply:"Reply received"};
+      j(`api/lead/${id}/history/`).then(d => {
+        if (d.error) { el.innerHTML = `<div class="hint">${esc(d.error)}</div>`; return; }
+        const rows = (d.events||[]).map(e => `<div class="feedrow">`
+          + `<span><b>${LBL[e.kind]||e.kind}</b>${e.body?": "+esc(e.body.slice(0,140)):""}${e.url?` <a href="${esc(e.url)}" target="_blank">↗</a>`:""}</span> `
+          + `<span class="hint">${esc(e.at)} · ${esc(e.account)}${e.campaign?" · "+esc(e.campaign):""}</span></div>`).join("");
+        el.innerHTML = `<h3 style="margin:4px 0">${esc(d.lead_name)} — full history (all accounts) `
+          + `<a href="#" onclick="document.getElementById('leadhist').style.display='none';return false" style="font-size:12px;font-weight:400">close</a></h3>`
+          + `<div class="hint" style="margin-bottom:6px">In campaigns: ${d.campaigns.length?d.campaigns.map(esc).join(", "):"—"}</div>`
+          + (rows || '<div class="hint">No interactions recorded yet.</div>');
+      });
+    };
     function loadContext(){
       j("api/context/").then(d => { document.getElementById("ctxbox").value = d.ai_context || ""; });
     }
