@@ -135,6 +135,7 @@ def start_browser_session(session):
         logger.info("Loading saved session for %s", session)
 
     session.page, session.context, session.browser, session.playwright = _launch_fingerprinted(storage_state, session.linkedin_profile)
+    session.attach_voyager_capture()
 
     if not storage_state:
         _fresh_login(session)
@@ -217,3 +218,36 @@ def verify_account(profile):
                 playwright.stop()
         except Exception:
             pass
+
+
+def _patch_voyager_headers():
+    """Make linkedin_cli's PlaywrightLinkedinAPI include the session's captured
+    x-li-track / x-li-page-instance — the headers a real LinkedIn web client sends
+    on every voyager/api call (the 'missing headers' that fingerprint bare API
+    traffic). Applied once, idempotent."""
+    try:
+        from linkedin_cli.api.client import PlaywrightLinkedinAPI
+    except Exception:
+        return
+    if getattr(PlaywrightLinkedinAPI, "_li_headers_patched", False):
+        return
+    _orig_init = PlaywrightLinkedinAPI.__init__
+
+    def _init(self, *a, **k):
+        _orig_init(self, *a, **k)
+        try:
+            sess = getattr(self, "session", None)
+            t = getattr(sess, "_li_track", None)
+            pi = getattr(sess, "_li_page_instance", None)
+            if t:
+                self.headers["x-li-track"] = t
+            if pi:
+                self.headers["x-li-page-instance"] = pi
+        except Exception:
+            pass
+
+    PlaywrightLinkedinAPI.__init__ = _init
+    PlaywrightLinkedinAPI._li_headers_patched = True
+
+
+_patch_voyager_headers()

@@ -33,12 +33,45 @@ class AccountSession:
         self.context = None
         self.browser = None
         self.playwright = None
+        # The real x-li-track / x-li-page-instance LinkedIn's own JS attaches to
+        # voyager/api requests — captured live so our fetch()es match the web
+        # client (a real clientVersion that rotates ~monthly, and a page-instance
+        # matching the page we navigated). See attach_voyager_capture().
+        self._li_track = None
+        self._li_page_instance = None
 
     @cached_property
     def campaigns(self):
         """All campaigns this user belongs to (cached)."""
         from linkedin.models import Campaign
         return list(Campaign.objects.filter(users=self.django_user))
+
+    def attach_voyager_capture(self):
+        """Listen for LinkedIn's own voyager/api requests and remember the
+        x-li-track / x-li-page-instance headers it sends, so our API client can
+        replicate them. Best-effort; never raises."""
+        page = self.page
+        if page is None:
+            return
+
+        def _cap(req):
+            try:
+                if "/voyager/" not in req.url:
+                    return
+                h = req.headers
+                t = h.get("x-li-track")
+                pi = h.get("x-li-page-instance")
+                if t:
+                    self._li_track = t
+                if pi:
+                    self._li_page_instance = pi
+            except Exception:
+                pass
+
+        try:
+            page.on("request", _cap)
+        except Exception:
+            pass
 
     def close_browser(self):
         """Tear down the browser/Playwright so no session is held open outside the
