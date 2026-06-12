@@ -309,8 +309,14 @@ def next_action_at(account, action_type):
     sent = daily_count(account, action_type)
     # Anchor the next send to its slot in today's window (not to the last send),
     # so lost time is recoverable.
-    slot = _window_open_today(account, now) + timedelta(seconds=sent * spacing)
-    slot += timedelta(seconds=random.uniform(-0.2, 0.2) * spacing)  # jitter
+    win_open = _window_open_today(account, now)
+    slot = win_open + timedelta(seconds=sent * spacing)
+    # WIDE jitter so sends land at irregular, human times across 09:00-17:00 —
+    # not a metronomic ~19-min drumbeat. The min-gap floor below still prevents
+    # any burst, and is_send_time keeps everything inside the window.
+    slot += timedelta(seconds=random.uniform(-0.7, 0.7) * spacing)
+    if slot < win_open:
+        slot = win_open
 
     if slot <= now:  # on-schedule or behind → eligible, but floor the gap
         last = _last_action_at(account, action_type)

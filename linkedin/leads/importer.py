@@ -113,6 +113,9 @@ def scrape_search_url(session, url: str, cap: int = SEARCH_IMPORT_CAP) -> list[s
     page_num = 1
     while len(collected) < cap:
         page_url = _with_page(url, page_num)
+        if page_num > 1:  # human pause between result pages — never a rapid scrape burst
+            from linkedin.browser.session import random_sleep
+            random_sleep(6, 12)
         goto_page(
             session,
             action=lambda u=page_url: session.page.goto(u),
