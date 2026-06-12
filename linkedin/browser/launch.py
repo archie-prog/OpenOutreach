@@ -29,18 +29,18 @@ _COHERENCE_JS = r'''
   def(navigator, 'platform', 'Linux x86_64');
   def(navigator, 'languages', ['en-GB']);
   def(navigator, 'deviceMemory', 8);
-  // Mask the Xvfb software renderer (SwiftShader) with a plausible Linux Intel
-  // GPU, coherent with a Linux laptop; preserve native-looking toString.
+  // stealth spoofs the WebGL renderer to a MAC string (Intel Iris OpenGL Engine),
+  // incoherent on Linux AND mismatched against the real llvmpipe canvas pixels.
+  // Override it back to the HONEST Mesa/llvmpipe value this box actually renders.
   const VENDOR = 37445, RENDERER = 37446;
-  const protos = [window.WebGLRenderingContext && WebGLRenderingContext.prototype,
-                  window.WebGL2RenderingContext && WebGL2RenderingContext.prototype];
-  for (const proto of protos) {
+  for (const proto of [window.WebGLRenderingContext && WebGLRenderingContext.prototype,
+                       window.WebGL2RenderingContext && WebGL2RenderingContext.prototype]) {
     if (!proto) continue;
     const orig = proto.getParameter;
-    const patched = function(pname) {
-      if (pname === VENDOR) return 'Intel Inc.';
-      if (pname === RENDERER) return 'ANGLE (Intel, Mesa Intel(R) UHD Graphics (CML GT2), OpenGL 4.6)';
-      return orig.call(this, pname);
+    const patched = function(pn) {
+      if (pn === VENDOR) return 'Google Inc. (Mesa/X.org)';
+      if (pn === RENDERER) return 'ANGLE (Mesa/X.org, llvmpipe (LLVM 15.0.6 256 bits), OpenGL 4.5)';
+      return orig.call(this, pn);
     };
     try { Object.defineProperty(patched, 'toString', {value: () => orig.toString(), configurable: true}); } catch(e){}
     proto.getParameter = patched;
@@ -67,7 +67,16 @@ def _launch_fingerprinted(storage_state, account=None):
     # disable the AutomationControlled blink feature. Stealth covers the JS side.
     browser = playwright.chromium.launch(
         headless=False,
-        args=["--disable-blink-features=AutomationControlled"],
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            # Real GPU rendering (needs /dev/dri/renderD128 mapped into the
+            # container) so WebGL/canvas are not software SwiftShader — which the
+            # deep fingerprint/APFC collector reads as virtualized.
+            "--use-gl=angle",
+            "--use-angle=gl",
+            "--ignore-gpu-blocklist",
+            "--enable-gpu-rasterization",
+        ],
         ignore_default_args=["--enable-automation"],
     )
     context = browser.new_context(
