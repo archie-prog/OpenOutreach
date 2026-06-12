@@ -21,6 +21,34 @@ logger = logging.getLogger(__name__)
 LINKEDIN_FEED_URL = "https://www.linkedin.com/feed/"
 
 
+_COHERENCE_JS = r'''
+(() => {
+  const def = (o, k, v) => { try { Object.defineProperty(o, k, {get: () => v, configurable: true}); } catch(e){} };
+  // stealth lies these into Win32 / en-US — force them coherent with the real
+  // Linux/en-GB browser so getHasLiedOs / getHasLiedLanguages do not trip.
+  def(navigator, 'platform', 'Linux x86_64');
+  def(navigator, 'languages', ['en-GB']);
+  def(navigator, 'deviceMemory', 8);
+  // Mask the Xvfb software renderer (SwiftShader) with a plausible Linux Intel
+  // GPU, coherent with a Linux laptop; preserve native-looking toString.
+  const VENDOR = 37445, RENDERER = 37446;
+  const protos = [window.WebGLRenderingContext && WebGLRenderingContext.prototype,
+                  window.WebGL2RenderingContext && WebGL2RenderingContext.prototype];
+  for (const proto of protos) {
+    if (!proto) continue;
+    const orig = proto.getParameter;
+    const patched = function(pname) {
+      if (pname === VENDOR) return 'Intel Inc.';
+      if (pname === RENDERER) return 'ANGLE (Intel, Mesa Intel(R) UHD Graphics (CML GT2), OpenGL 4.6)';
+      return orig.call(this, pname);
+    };
+    try { Object.defineProperty(patched, 'toString', {value: () => orig.toString(), configurable: true}); } catch(e){}
+    proto.getParameter = patched;
+  }
+})();
+'''
+
+
 def _launch_fingerprinted(storage_state, account=None):
     """Launch a stealthed browser with a consistent, region-correct fingerprint:
     locale + timezone matched to the account and a fixed viewport. We deliberately
@@ -55,6 +83,13 @@ def _launch_fingerprinted(storage_state, account=None):
             Stealth().apply_stealth_sync(context)
         except Exception:
             pass
+    # Stealth's spoofs are INCOHERENT on this Linux box (platform->Win32,
+    # languages->en-US, WebGL->Mac) which trips LinkedIn's lie-detector; correct
+    # them back to coherent Linux/en-GB values.
+    try:
+        context.add_init_script(_COHERENCE_JS)
+    except Exception:
+        pass
     page = context.new_page()
     return page, context, browser, playwright
 
