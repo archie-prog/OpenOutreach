@@ -373,6 +373,14 @@ def _mark_contacted(session, state):
 
 
 def _handle_message(session, state, step):
+    # Live reply-check FIRST: if the lead replied (e.g. during the preceding
+    # Wait), STOP — never send the next message after a reply. The background
+    # poller may not have scanned this lead yet, so we re-check at send time.
+    from linkedin.inbox.poller import has_new_reply
+    if has_new_reply(session, state):
+        logger.info("Lead %s replied before the scheduled message — stopping sequence", state.lead_id)
+        _set_state(state, LeadCampaignState.State.STOPPED_REPLY)
+        return
     send_message(session, state, step)
     _mark_contacted(session, state)
     _log(session, state, step, ActionLog.ActionType.MESSAGE)
@@ -385,6 +393,11 @@ def _handle_inmail(session, state, step):
     if is_connection_accepted(session, state):
         logger.info("Lead %s connected before InMail — skipping InMail", state.lead_id)
         _goto(state, step.next_step(Branch.SUCCESS))
+        return
+    from linkedin.inbox.poller import has_new_reply
+    if has_new_reply(session, state):
+        logger.info("Lead %s replied before the scheduled InMail — stopping sequence", state.lead_id)
+        _set_state(state, LeadCampaignState.State.STOPPED_REPLY)
         return
     result = send_inmail(session, state, step)
     if result.get("success"):

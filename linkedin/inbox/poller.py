@@ -143,6 +143,27 @@ def _lead_campaign(lead):
     return state.campaign if state else None
 
 
+def has_new_reply(session, state) -> bool:
+    """Live check: has this lead sent us an inbound message since our last action?
+
+    Used as a send-time guard so a reply that lands *during a Wait* stops the next
+    message — the background ``poll_replies`` rotates through leads and may not have
+    scanned this one yet, so relying on it alone leaves a race where we'd message
+    someone who already replied. Best-effort: a fetch failure returns False (we
+    proceed) rather than blocking the sequence."""
+    if not state.last_action_at:
+        return False
+    try:
+        messages = fetch_thread_messages(session, state.lead)
+    except Exception:
+        logger.warning("reply pre-check fetch failed for lead %s — proceeding", state.lead_id)
+        return False
+    for m in messages:
+        if m["direction"] == "in" and m["sent_at"] and m["sent_at"] > state.last_action_at:
+            return True
+    return False
+
+
 def poll_replies(session, campaign=None, limit=None) -> int:
     """Poll active sequence leads; persist messages; stop any that replied.
     Returns the number of states transitioned to ``stopped_reply``.
