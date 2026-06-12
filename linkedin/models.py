@@ -111,12 +111,12 @@ class Campaign(models.Model):
     # intentional list of existing contacts (you accept they may have been
     # messaged before). See the connection-provenance guard in sequences/executor.
     include_current_network = models.BooleanField(default=False)
-    # Which LinkedIn account sends for this campaign. Null = the worker's
-    # default (first active account) - preserves single-account behavior for
-    # campaigns created before multi-account support.
-    sending_account = models.ForeignKey(
-        "linkedin.LinkedInProfile", null=True, blank=True,
-        on_delete=models.SET_NULL, related_name="sending_campaigns",
+    # The pool of LinkedIn accounts this campaign may send from. Empty = the
+    # worker's default (first active account). Each enrolled lead is assigned ONE
+    # account from this pool (see LeadCampaignState.sending_account) and keeps it
+    # for its whole sequence, so a lead's connect + follow-ups stay on one account.
+    sending_accounts = models.ManyToManyField(
+        "linkedin.LinkedInProfile", blank=True, related_name="sending_campaigns",
     )
 
     def __str__(self):
@@ -447,6 +447,14 @@ class LeadCampaignState(models.Model):
     # request was accepted. Gates messaging: by default the kit only messages
     # people whose connection it made itself (see Campaign.include_current_network).
     connected_via_tool = models.BooleanField(default=False)
+    # The account assigned to run THIS lead's sequence — chosen from the
+    # campaign's sending_accounts pool the first time the lead is run, then sticky
+    # (a lead's whole sequence must stay on the account that made its connection).
+    # Null until assigned (or when the campaign has no pool -> the default account).
+    sending_account = models.ForeignKey(
+        "linkedin.LinkedInProfile", null=True, blank=True,
+        on_delete=models.SET_NULL, related_name="assigned_states",
+    )
     next_action_due_at = models.DateTimeField(null=True, blank=True, db_index=True)
     last_action_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(default=timezone.now)

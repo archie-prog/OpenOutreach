@@ -274,9 +274,7 @@
           <div style="flex:1"><label>Sequence (the flow)</label><select id="nc_seq"></select></div>
           <div style="flex:1"><label>Lead list (optional — add more later)</label><select id="nc_list"></select></div>
         </div>
-        <div style="display:flex;gap:10px;flex-wrap:wrap">
-          <div style="flex:1"><label>Sending account (which LinkedIn account sends this campaign)</label><select id="nc_account"></select></div>
-        </div>
+        <div><label>Sending accounts (which LinkedIn accounts send this campaign — leave all unchecked to use the default)</label><div id="nc_accounts"></div></div>
         <label style="display:inline"><input type="checkbox" id="nc_active" checked> Launch active now (start contacting)</label>
         <label style="display:block;margin-top:8px"><input type="checkbox" id="nc_inclnet"> <b>Include current network</b> — also contact people already connected on this account</label>
         <div class="hint" style="margin-top:2px">⚠️ Leave OFF (recommended). When OFF, the kit only messages people whose connection <b>it</b> made — it skips anyone you're already connected to or have contacted before. Turn ON <b>only</b> if this lead list is intentionally your existing contacts.</div>
@@ -603,9 +601,9 @@
           sd.sequences.map(s => `<option value="${s.id}">${s.name}</option>`).join("");
         const listOpts = `<option value="">— none yet —</option>` + ld.lists.map(l => `<option value="${l.id}">${l.name} (${l.count})</option>`).join("");
         document.getElementById("nc_list").innerHTML = listOpts;
-        document.getElementById("nc_account").innerHTML = ALL_ACCOUNTS.length
-          ? ALL_ACCOUNTS.map(a => `<option value="${a.id}">${a.name}</option>`).join("")
-          : `<option value="">(no active accounts)</option>`;
+        document.getElementById("nc_accounts").innerHTML = ALL_ACCOUNTS.length
+          ? ALL_ACCOUNTS.map(a => `<label style="display:inline-block;margin-right:14px"><input type="checkbox" class="nc_acct" value="${a.id}"> ${a.name}</label>`).join("")
+          : `<span class="hint">(no active accounts — add one in the Accounts tab)</span>`;
         renderCampaigns();
       });
     }
@@ -620,7 +618,7 @@
           : `<button onclick="setCampStatus(${c.id},'active')">▶ Activate</button>`;
         const nm = (c.name||'').replace(/'/g,"\\'");
         return `<tr>
-          <td><a href="#" onclick="openCampaign(${c.id},'${nm}');return false"><b>${c.name}</b></a><div class="hint">via ${c.sending_account || 'default account'}</div></td><td>${c.sequence}</td><td>${c.lead_list||"—"}</td><td>${c.leads}</td>
+          <td><a href="#" onclick="openCampaign(${c.id},'${nm}');return false"><b>${c.name}</b></a><div class="hint">via ${(c.sending_accounts && c.sending_accounts.length) ? c.sending_accounts.join(', ') : 'default account'}</div></td><td>${c.sequence}</td><td>${c.lead_list||"—"}</td><td>${c.leads}</td>
           <td><span class="pill ${c.status}">${STATUS_LABEL[c.status]||c.status}</span></td>
           <td>${listSelect(c.id)} <button onclick="addLeads(${c.id})">+ Add</button></td>
           <td>${toggle} <button onclick="openCampaign(${c.id}, '${nm}')">View</button> <button class="no" onclick="setCampStatus(${c.id},'archived')">🗑 Archive</button></td>
@@ -633,19 +631,20 @@
       const lead_list_id = gv("nc_list") || null;
       const status = document.getElementById("nc_active").checked ? "active" : "draft";
       const include_current_network = document.getElementById("nc_inclnet").checked;
-      const sending_account_id = gv("nc_account") || null;
+      const sending_account_ids = [...document.querySelectorAll(".nc_acct:checked")].map(c => +c.value);
       if (!name) { toast("Name the campaign", "err"); return; }
       if (!sequence_id) { toast("Pick a sequence", "err"); return; }
-      j("api/campaigns/create/", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({name, sequence_id, lead_list_id, status, include_current_network, sending_account_id})})
+      j("api/campaigns/create/", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({name, sequence_id, lead_list_id, status, include_current_network, sending_account_ids})})
         .then(r => { if(r.ok){ document.getElementById("nc_name").value=""; document.getElementById("nc_inclnet").checked=false; toast(`Campaign created${r.enrolled?` — ${r.enrolled} leads enrolled`:""}.`, "ok"); loadCampaigns(); } });
     };
     window.setInclNet = (id, on) => {
       j(`api/campaign/${id}/update/`, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({include_current_network: on})})
         .then(r => { if(r.ok) toast(on ? "Now including current network — existing connections CAN be contacted" : "Existing network excluded — only kit-made connections will be messaged", "ok"); });
     };
-    window.setCampAccount = (id, val) => {
-      j(`api/campaign/${id}/update/`, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({sending_account_id: val || null})})
-        .then(r => { if(r.ok) { toast("Sending account updated", "ok"); loadCampaigns(); } });
+    window.setCampAccounts = (id) => {
+      const ids = [...document.querySelectorAll(".cd_acct_"+id+":checked")].map(c => +c.value);
+      j(`api/campaign/${id}/update/`, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({sending_account_ids: ids})})
+        .then(r => { if(r.ok) { toast(ids.length?`Sending from ${ids.length} account(s)`:"Using default account", "ok"); loadCampaigns(); } });
     };
     window.setCampStatus = (id, status) => {
       if (status === "archived" && !confirm("Archive this campaign? It stops contacting and is hidden (not deleted).")) return;
@@ -670,9 +669,9 @@
       // Overview + stats + activity + responses
       j(`api/campaign/${id}/detail/`).then(d => {
         document.getElementById("cd-title").innerHTML = `${esc(d.name)} <span class="pill ${d.status}">${STATUS_LABEL[d.status]||d.status}</span>`;
-        const acctOpts = ALL_ACCOUNTS.map(a => `<option value="${a.id}" ${a.id===d.sending_account_id?"selected":""}>${a.name}</option>`).join("");
+        const acctChecks = ALL_ACCOUNTS.map(a => `<label style="display:inline-block;margin-right:14px"><input type="checkbox" class="cd_acct_${d.id}" value="${a.id}" ${(d.sending_account_ids||[]).includes(a.id)?"checked":""} onchange="setCampAccounts(${d.id})"> ${a.name}</label>`).join("");
         document.getElementById("cd-meta").innerHTML = `Sequence: ${esc(d.sequence||"—")}  ·  Primary lead list: ${esc(d.lead_list||"—")}`
-          + `<div style="margin-top:8px"><label style="display:inline;font-size:13px">Sending account: </label><select onchange="setCampAccount(${d.id}, this.value)"><option value="">Default (first active)</option>${acctOpts}</select> <span class="hint">— the LinkedIn account this campaign sends from</span></div>`
+          + `<div style="margin-top:8px"><b style="font-size:13px">Sending accounts:</b> ${acctChecks || '<span class="hint">(no active accounts)</span>'} <span class="hint">— leave all unchecked = default account</span></div>`
           + `<div style="margin-top:8px"><label style="display:inline;font-size:13px"><input type="checkbox" id="cd_inclnet" ${d.include_current_network?"checked":""} onchange="setInclNet(${d.id}, this.checked)"> Include current network (contact people already connected)</label>`
           + ` <span class="hint">— ${d.include_current_network ? "ON: existing connections can be messaged" : "OFF: only connections the kit made are messaged; existing/already-contacted people are skipped"}</span></div>`;
         const S = d.stats;

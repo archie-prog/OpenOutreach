@@ -138,7 +138,11 @@ def due_states(campaign=None):
         qs = qs.filter(campaign=campaign)
     # Highest AI fit first, so capped actions (esp. the ~15/mo InMails) are
     # spent on the best candidates.
-    return qs.select_related("current_step", "lead", "campaign", "campaign__sending_account").order_by("-lead__ai_score")
+    return (
+        qs.select_related("current_step", "lead", "campaign", "sending_account")
+        .prefetch_related("campaign__sending_accounts")
+        .order_by("-lead__ai_score")
+    )
 
 
 def run_due_states(session, campaign=None, limit=None) -> int:
@@ -158,14 +162,36 @@ def run_due_states(session, campaign=None, limit=None) -> int:
 
 
 
+def _account_for_state(state, fallback_profile, pool_cache):
+    """The account that should run *state*: its sticky assignment if already set,
+    otherwise one picked from the campaign's sending_accounts pool (deterministic
+    by lead id so a given pool always maps a lead to the same account) and then
+    persisted. Falls back to *fallback_profile* (NOT persisted) when the pool is
+    empty, so adding a pool later still lets unassigned leads distribute."""
+    if state.sending_account_id:
+        return state.sending_account
+    cid = state.campaign_id
+    if cid not in pool_cache:
+        pool_cache[cid] = sorted(state.campaign.sending_accounts.all(), key=lambda pr: pr.pk)
+    pool = pool_cache[cid]
+    if not pool:
+        return fallback_profile
+    chosen = pool[state.lead_id % len(pool)]
+    LeadCampaignState.objects.filter(pk=state.pk).update(sending_account=chosen)
+    state.sending_account = chosen
+    return chosen
+
+
 def due_states_by_account(fallback_profile):
-    """Group every due state by the LinkedIn account that should send it — its
-    campaign's ``sending_account``, or *fallback_profile* when unset. Returns a
-    list of ``(profile, [states])``, preserving the ai-score order within each
-    account so capped actions still favor the best leads."""
-    groups = {}  # pk -> [profile, [states]]
+    """Group every due state by the account assigned to run it. Each lead gets a
+    sticky account from its campaign's ``sending_accounts`` pool (or
+    *fallback_profile* when the pool is empty), assigned on first run and kept for
+    the whole sequence. Returns ``(profile, [states])`` in ai-score order within
+    each account so capped actions still favor the best leads."""
+    groups = {}      # pk -> [profile, [states]]
+    pool_cache = {}  # campaign_id -> [profiles]
     for st in due_states():
-        acct = st.campaign.sending_account or fallback_profile
+        acct = _account_for_state(st, fallback_profile, pool_cache)
         if acct is None:
             continue
         if acct.pk not in groups:
@@ -190,15 +216,15 @@ def run_states(session, states) -> int:
 
 
 def active_sending_accounts(fallback_profile):
-    """Distinct accounts to service this cycle: the sending_account of every
-    ACTIVE campaign (fallback_profile when unset). Drives per-account reply
-    polling even for accounts with no due state right now."""
+    """Distinct accounts to service this cycle: the union of every ACTIVE
+    campaign's sending_accounts pool (fallback_profile for campaigns whose pool is
+    empty). Drives per-account reply polling even with no due state right now."""
     from linkedin.models import Campaign
 
     accts = {}
-    for c in Campaign.objects.filter(status=Campaign.Status.ACTIVE).select_related("sending_account"):
-        a = c.sending_account or fallback_profile
-        if a is not None:
+    for c in Campaign.objects.filter(status=Campaign.Status.ACTIVE).prefetch_related("sending_accounts"):
+        pool = list(c.sending_accounts.all()) or ([fallback_profile] if fallback_profile else [])
+        for a in pool:
             accts.setdefault(a.pk, a)
     return list(accts.values())
 
