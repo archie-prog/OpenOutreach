@@ -29,17 +29,18 @@ _COHERENCE_JS = r'''
   def(navigator, 'platform', 'Linux x86_64');
   def(navigator, 'languages', ['en-GB']);
   def(navigator, 'deviceMemory', 8);
-  // stealth spoofs the WebGL renderer to a MAC string (Intel Iris OpenGL Engine),
-  // incoherent on Linux AND mismatched against the real llvmpipe canvas pixels.
-  // Override it back to the HONEST Mesa/llvmpipe value this box actually renders.
+  // We now render on the REAL Intel GPU (via the host's :0 display), so the
+  // canvas/WebGL pixels are genuine hardware. stealth spoofs the renderer to a
+  // MAC string though, so override that lie back to the true Intel value that
+  // MATCHES the actual hardware pixels (coherent + honest = a real laptop).
   const VENDOR = 37445, RENDERER = 37446;
   for (const proto of [window.WebGLRenderingContext && WebGLRenderingContext.prototype,
                        window.WebGL2RenderingContext && WebGL2RenderingContext.prototype]) {
     if (!proto) continue;
     const orig = proto.getParameter;
     const patched = function(pn) {
-      if (pn === VENDOR) return 'Google Inc. (Mesa/X.org)';
-      if (pn === RENDERER) return 'ANGLE (Mesa/X.org, llvmpipe (LLVM 15.0.6 256 bits), OpenGL 4.5)';
+      if (pn === VENDOR) return 'Google Inc. (Intel)';
+      if (pn === RENDERER) return 'ANGLE (Intel, Mesa Intel(R) HD Graphics 4000 (IVB GT2), OpenGL 4.2)';
       return orig.call(this, pn);
     };
     try { Object.defineProperty(patched, 'toString', {value: () => orig.toString(), configurable: true}); } catch(e){}
@@ -76,6 +77,8 @@ def _launch_fingerprinted(storage_state, account=None):
             "--use-angle=gl",
             "--ignore-gpu-blocklist",
             "--enable-gpu-rasterization",
+            "--no-sandbox",
+            "--disable-gpu-sandbox",
         ],
         ignore_default_args=["--enable-automation"],
     )
