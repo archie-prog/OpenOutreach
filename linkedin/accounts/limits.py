@@ -314,7 +314,9 @@ def next_action_at(account, action_type):
     # WIDE jitter so sends land at irregular, human times across 09:00-17:00 —
     # not a metronomic ~19-min drumbeat. The min-gap floor below still prevents
     # any burst, and is_send_time keeps everything inside the window.
-    slot += timedelta(seconds=random.uniform(-0.7, 0.7) * spacing)
+    # Gaussian (bell-shaped) jitter, clamped — NOT uniform: LinkedIn's anti-abuse
+    # explicitly flags flat/uniform inter-action distributions.
+    slot += timedelta(seconds=max(-1.0, min(1.0, random.gauss(0, 0.5))) * spacing)
     if slot < win_open:
         slot = win_open
 

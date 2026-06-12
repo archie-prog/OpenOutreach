@@ -127,10 +127,10 @@ def _compose_inmail(session, lead, subject: str, body: str):
                 pass
         if field is None:
             raise InMailUnavailable("no Subject field — not an InMail composer (no credits?)")
-        from linkedin_cli.browser.nav import human_type
-        human_type(field, subject)
+        from linkedin.browser.humanize import type_humanly
+        type_humanly(field, subject)
 
-    from linkedin_cli.browser.nav import human_type
-    human_type(page.get_by_role("textbox").last, body)
+    from linkedin.browser.humanize import type_humanly
+    type_humanly(page.get_by_role("textbox").last, body)
     page.get_by_role("button", name="Send").click()
     return None
