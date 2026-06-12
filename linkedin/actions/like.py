@@ -43,6 +43,40 @@ def _label_is_liked(label: str | None) -> bool:
     return bool(label) and "no reaction" not in label
 
 
+# LinkedIn serves TWO reaction-button markups (varies by account/A-B/page):
+#   (a) new: <button aria-label="Reaction button state: no reaction|Like|...">  (state in label)
+#   (b) old: <button aria-label="React Like to <name>'s post" aria-pressed=...>  (state in aria-pressed)
+# The like action must handle both, or it silently no-ops on the variant it
+# doesn't recognise.
+_REACTION_SEL = 'button[aria-label^="Reaction button state:"], button[aria-label*="React Like"]'
+
+
+def _post_reaction_button(page):
+    """The POST's reaction button (not a comment's), in whichever markup is live.
+    Returns a locator or None."""
+    b = page.locator('button[aria-label^="Reaction button state:"]').first
+    if b.count():
+        return b
+    btns = page.locator('button[aria-label*="React Like"]')
+    for i in range(btns.count()):
+        bi = btns.nth(i)
+        if "comment" in (bi.get_attribute("aria-label") or "").lower():
+            continue  # skip comment reaction buttons
+        return bi
+    return None
+
+
+def _btn_is_liked(btn) -> bool:
+    """Whether the located reaction button shows we've reacted — both markups."""
+    try:
+        lab = (btn.get_attribute("aria-label") or "").strip().lower()
+    except Exception:
+        lab = ""
+    if lab.startswith("reaction button state:"):
+        return "no reaction" not in lab
+    return (btn.get_attribute("aria-pressed") or "").lower() == "true"
+
+
 def _latest_post_url(page, fallback: str) -> str:
     """Permalink of the member's most recent activity (top container's data-urn).
     Falls back to the recent-activity page when no activity urn is present."""
@@ -124,35 +158,35 @@ def _like(session, lead) -> dict:
     if "/feed/update/" in post_url:
         page.goto(post_url, wait_until="domcontentloaded")
         try:
-            page.wait_for_selector(_REACTION_BTN, timeout=10000)
+            page.wait_for_selector(_REACTION_SEL, timeout=10000)
         except Exception:
             pass
 
     from linkedin.browser.humanize import humanize_page
     humanize_page(page)
-    label = _reaction_label(page)
-    if label is None:
+    btn = _post_reaction_button(page)
+    if btn is None:
         return {"success": False, "error": "no reaction button found (no recent post?)", "post_url": post_url}
 
-    if _label_is_liked(label):
+    if _btn_is_liked(btn):
         logger.info("Most recent post already liked for %s", lead.public_identifier)
         return {"success": True, "already_liked": True, "post_url": post_url}
 
-    btn = page.locator(_REACTION_BTN).first
     try:
         btn.scroll_into_view_if_needed()
     except Exception:
         pass
     btn.click()
 
-    # VERIFY the like actually registered — re-read the label until it flips.
-    # Never report success on a no-op click (the old bug).
+    # VERIFY the like registered — re-locate the button and confirm the liked
+    # state flipped (handles both markups). Never report success on a no-op click.
     for _ in range(10):
         try:
             page.wait_for_timeout(500)
         except Exception:
             pass
-        if _label_is_liked(_reaction_label(page)):
+        b2 = _post_reaction_button(page)
+        if b2 is not None and _btn_is_liked(b2):
             logger.info("Liked most recent post for %s", lead.public_identifier)
             return {"success": True, "already_liked": False, "post_url": post_url}
 
