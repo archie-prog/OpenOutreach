@@ -178,6 +178,19 @@ def _like(session, lead) -> dict:
         pass
     btn.click()
 
+    # On the "React Like" markup the button can open a reaction PICKER flyout
+    # instead of liking directly — if it does, click "Like" inside the flyout.
+    try:
+        page.wait_for_timeout(700)
+        flyout_like = page.locator(
+            '[class*="reactions-menu"] button[aria-label="Like"], '
+            '[class*="reactions-menu"] [aria-label="Like"]'
+        ).first
+        if flyout_like.count() and flyout_like.is_visible():
+            flyout_like.click()
+    except Exception:
+        pass
+
     # VERIFY the like registered — re-locate the button and confirm the liked
     # state flipped (handles both markups). Never report success on a no-op click.
     for _ in range(10):
