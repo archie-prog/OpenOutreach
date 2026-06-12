@@ -225,7 +225,8 @@ def active_sending_accounts(fallback_profile):
     for c in Campaign.objects.filter(status=Campaign.Status.ACTIVE).prefetch_related("sending_accounts"):
         pool = list(c.sending_accounts.all()) or ([fallback_profile] if fallback_profile else [])
         for a in pool:
-            accts.setdefault(a.pk, a)
+            if a.auto_paused_at is None:  # never schedule an auto-paused (flagged) account
+                accts.setdefault(a.pk, a)
     return list(accts.values())
 
 

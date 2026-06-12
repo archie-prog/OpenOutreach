@@ -249,6 +249,11 @@ class LinkedInProfile(models.Model):
     last_verified_at = models.DateTimeField(null=True, blank=True)
     last_verify_ok = models.BooleanField(null=True)
     last_verify_error = models.CharField(max_length=300, blank=True, default="")
+    # Set when the worker auto-pauses this account after LinkedIn rejected its
+    # session (e.g. 401 / restriction). While set, the worker does NOT touch the
+    # account — it never hammers a flagged session. Cleared by a successful
+    # connection test (so the user resolves it in LinkedIn, then re-tests).
+    auto_paused_at = models.DateTimeField(null=True, blank=True)
     # Per-account sending schedule: messages/connects/etc. only go out inside this
     # local window, on these weekdays, optionally skipping bank holidays.
     send_start_hour = models.PositiveSmallIntegerField(default=9)   # inclusive, local

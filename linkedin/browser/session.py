@@ -40,6 +40,17 @@ class AccountSession:
         from linkedin.models import Campaign
         return list(Campaign.objects.filter(users=self.django_user))
 
+    def close_browser(self):
+        """Tear down the browser/Playwright so no session is held open outside the
+        account's working hours. ensure_browser() relaunches it on next use."""
+        for obj, meth in ((self.browser, "close"), (self.playwright, "stop")):
+            try:
+                if obj:
+                    getattr(obj, meth)()
+            except Exception:
+                pass
+        self.page = self.context = self.browser = self.playwright = None
+
     def ensure_browser(self):
         """Launch or recover browser + login if needed. Call before using .page"""
         from linkedin.browser.launch import start_browser_session

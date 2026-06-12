@@ -131,6 +131,42 @@ def is_send_time(account, dt=None) -> bool:
     return account.send_start_hour <= local.hour < account.send_end_hour
 
 
+def daily_session_window(account, date=None):
+    """The account's actual working session for a local date: opens at a random
+    minute within the first 30 min of its send window, closes at a random minute
+    within the last 30 min — stable per (account, date) so it doesn't jitter each
+    cycle. Returns (open_dt, close_dt) aware datetimes, or (None, None) on a
+    non-working day (wrong weekday / skipped bank holiday)."""
+    import random as _random
+    from datetime import timedelta
+
+    tz = _account_tz(account)
+    now_local = timezone.now().astimezone(tz)
+    d = date or now_local.date()
+    weekdays = account.send_weekdays or [0, 1, 2, 3, 4]
+    if d.weekday() not in weekdays or _is_bank_holiday(account, d):
+        return None, None
+    rnd = _random.Random("%s:%s:session" % (account.pk, d.isoformat()))
+    open_min = rnd.randint(0, 29)
+    close_min = rnd.randint(0, 29)
+    anchor = now_local.replace(year=d.year, month=d.month, day=d.day)
+    open_dt = _at_hour(anchor, account.send_start_hour) + timedelta(minutes=open_min)
+    close_dt = _at_hour(anchor, account.send_end_hour) - timedelta(minutes=close_min)
+    return open_dt, close_dt
+
+
+def in_session(account, now=None):
+    """True when the account is inside its randomized working session right now.
+    The gate for ALL of the worker's LinkedIn activity, so nothing runs overnight
+    or on non-working days (mimics a person opening LinkedIn ~09:00-09:30 and
+    closing it near end of day)."""
+    local = (now or timezone.now()).astimezone(_account_tz(account))
+    open_dt, close_dt = daily_session_window(account, local.date())
+    if open_dt is None:
+        return False
+    return open_dt <= local < close_dt
+
+
 def _at_hour(local, hour):
     """``local`` set to ``hour:00`` — but ``hour==24`` means midnight at the start
     of the next day (datetime can't hold hour 24). The UI allows an end hour of 24
