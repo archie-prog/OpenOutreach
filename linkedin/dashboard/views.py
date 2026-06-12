@@ -407,7 +407,7 @@ def _lead_name(lead):
 
 @staff_member_required
 def api_accounts(request):
-    from linkedin.accounts.limits import cap_for, daily_count, inmail_sent_this_month
+    from linkedin.accounts.limits import cap_for, daily_count, inmail_sent_this_month, weekly_count
     from linkedin.models import LinkedInProfile
 
     out = []
@@ -425,6 +425,8 @@ def api_accounts(request):
             "connect_random_enabled": a.connect_random_enabled,
             "connect_random_min": a.connect_random_min, "connect_random_max": a.connect_random_max,
             "connect_today": cap_for(a, "connect"),  # today's effective cap (random or fixed)
+            "connect_weekly_limit": a.connect_weekly_limit,
+            "connect_weekly_used": weekly_count(a, "connect"),
             "last_verify_ok": a.last_verify_ok,
             "last_verify_error": a.last_verify_error,
             "verify_requested": a.verify_requested,
@@ -520,6 +522,8 @@ def api_account_update(request, account_id):
         prof.cookie_data = None
     if _int("inmail_monthly_cap") is not None:
         prof.inmail_monthly_cap = max(0, _int("inmail_monthly_cap"))
+    if _int("connect_weekly_limit") is not None:
+        prof.connect_weekly_limit = max(0, _int("connect_weekly_limit"))
     # Start from the full default set so we never drop the action types the UI
     # doesn't expose (inmail/profile_visit/like_post) — dropping them would zero
     # their cap and stall those sequence steps.

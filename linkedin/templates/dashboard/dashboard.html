@@ -514,7 +514,7 @@
           <td>${a.has_totp?"✓":"—"}</td>
           <td>${a.connect_used}/<input type="number" value="${a.connect_cap}" id="ac_conn_${a.id}" style="width:50px" oninput="checkConnectCaps()" ${a.connect_random_enabled?"disabled":""}>
             <label style="font-size:11px;display:inline" title="Randomise the daily cap within a range"><input type="checkbox" id="ac_crand_${a.id}" ${a.connect_random_enabled?"checked":""} onchange="onConnRandom(${a.id})"> 🎲</label>
-            <span id="ac_crrange_${a.id}" style="${a.connect_random_enabled?"":"display:none"};white-space:nowrap"><input type="number" value="${a.connect_random_min}" id="ac_cmin_${a.id}" style="width:56px" oninput="checkConnectCaps()">–<input type="number" value="${a.connect_random_max}" id="ac_cmax_${a.id}" style="width:56px" oninput="checkConnectCaps()"> <span class="hint">today ${a.connect_today}</span></span></td>
+            <span id="ac_crrange_${a.id}" style="${a.connect_random_enabled?"":"display:none"};white-space:nowrap"><input type="number" value="${a.connect_random_min}" id="ac_cmin_${a.id}" style="width:56px" oninput="checkConnectCaps()">–<input type="number" value="${a.connect_random_max}" id="ac_cmax_${a.id}" style="width:56px" oninput="checkConnectCaps()"> <span class="hint">today ${a.connect_today}</span></span><div class="hint" style="margin-top:3px">week ${a.connect_weekly_used}/<input type="number" value="${a.connect_weekly_limit}" id="ac_wk_${a.id}" style="width:54px"> cap</div></td>
           <td>${a.message_used}/<input type="number" value="${a.message_cap}" id="ac_msg_${a.id}" style="width:58px"></td>
           <td>${a.inmail_used_month}/<input type="number" value="${a.inmail_monthly_cap}" id="ac_inm_${a.id}" style="width:48px"></td>
           <td rowspan="2"><button onclick="saveAccount(${a.id})">Save</button></td></tr>
@@ -590,6 +590,7 @@
         connect_random_enabled: document.getElementById("ac_crand_"+id).checked,
         connect_random_min: document.getElementById("ac_cmin_"+id).value,
         connect_random_max: document.getElementById("ac_cmax_"+id).value,
+        connect_weekly_limit: document.getElementById("ac_wk_"+id).value,
         message_cap: document.getElementById("ac_msg_"+id).value,
         inmail_monthly_cap: document.getElementById("ac_inm_"+id).value,
         send_start_hour: document.getElementById("ac_sh_"+id).value,
