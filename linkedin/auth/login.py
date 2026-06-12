@@ -76,8 +76,9 @@ def login_with_totp(session, username: str, password: str, totp_secret: str) -> 
     page = session.page
 
     page.goto(LOGIN_URL, wait_until="domcontentloaded")
-    page.fill("#username", username)
-    page.fill("#password", password)
+    from linkedin_cli.browser.nav import human_type
+    human_type(page.locator("#username"), username)
+    human_type(page.locator("#password"), password)
     page.get_by_role("button", name="Sign in").click()
     # CRITICAL: wait for the post-submit navigation before reading the URL,
     # otherwise we still see the login page and miss the challenge entirely.
@@ -122,9 +123,11 @@ def _submit_2fa(page, totp_secret: str, attempts: int = 2) -> None:
     for attempt in range(attempts):
         code = current_totp(totp_secret)
         try:
-            page.get_by_role("textbox").last.fill(code)
+            from linkedin_cli.browser.nav import human_type
+            human_type(page.get_by_role("textbox").last, code)
         except Exception:
-            page.fill("input[name='pin'], input#input__phone_verification_pin, input[type='text']", code)
+            from linkedin_cli.browser.nav import human_type
+            human_type(page.locator("input[name='pin'], input#input__phone_verification_pin, input[type='text']"), code)
         page.get_by_role("button", name="Submit").click()
         logger.info("Submitted TOTP 2FA code (attempt %d)", attempt + 1)
         _settle(page, timeout_ms=_CHALLENGE_TIMEOUT_MS)
@@ -168,9 +171,11 @@ def _maybe_submit_2fa(session, totp_secret: str) -> bool:
         return False
     code = current_totp(totp_secret)
     try:
-        page.get_by_role("textbox").last.fill(code)
+        from linkedin_cli.browser.nav import human_type
+        human_type(page.get_by_role("textbox").last, code)
     except Exception:
-        page.fill("input[type='text']", code)
+        from linkedin_cli.browser.nav import human_type
+        human_type(page.locator("input[type='text']"), code)
     page.get_by_role("button", name="Submit").click()
     logger.info("Submitted TOTP 2FA code natively")
     return True

@@ -65,7 +65,8 @@ def _connect_with_note(session, profile: dict, note: str) -> dict:
         box = page.get_by_role("textbox").first
     if box.count() == 0:
         return {"success": False, "error": "note textarea not found"}
-    box.fill(note)
+    from linkedin_cli.browser.nav import human_type
+    human_type(box, note)
 
     send = page.get_by_role("button", name="Send")
     if send.count() == 0:

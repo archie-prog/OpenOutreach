@@ -34,7 +34,14 @@ def _launch_fingerprinted(storage_state, account=None):
 
     tz = (getattr(account, "send_timezone", None) or "Europe/London")
     playwright = sync_playwright().start()
-    browser = playwright.chromium.launch(headless=False)
+    # Hide the automation switches: drop --enable-automation (which sets
+    # navigator.webdriver + the 'controlled by automated software' infobar) and
+    # disable the AutomationControlled blink feature. Stealth covers the JS side.
+    browser = playwright.chromium.launch(
+        headless=False,
+        args=["--disable-blink-features=AutomationControlled"],
+        ignore_default_args=["--enable-automation"],
+    )
     context = browser.new_context(
         storage_state=storage_state,
         locale="en-GB",
