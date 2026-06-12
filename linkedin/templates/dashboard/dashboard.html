@@ -161,7 +161,9 @@
       <div class="kpis" id="kpis"></div>
       <div class="card"><canvas id="kpichart" height="90"></canvas></div>
       <div class="card">
-        <div class="bar"><b>Activity</b> &nbsp; <select id="actfilter">
+        <div class="bar"><b>Activity</b> <button id="dash-act-btn" data-show="View activity" data-hide="Hide activity" style="font-size:12px;margin-left:8px" onclick="toggleSection('dash-activity-wrap', this)">View activity</button></div>
+        <div id="dash-activity-wrap" style="display:none">
+        <div class="bar"><label>Show</label> <select id="actfilter">
           <option value="">All activity</option>
           <option value="connect_accepted">Connections accepted</option>
           <option value="like_post">Posts liked</option>
@@ -170,6 +172,7 @@
           <option value="inmail">InMails sent</option>
         </select></div>
         <div id="activityfeed"></div>
+        </div>
       </div>
       <h2>Senders</h2>
       <table id="senders"><thead><tr><th>Account</th><th>Active</th><th>InMail</th><th>Connect/day</th><th>Message/day</th></tr></thead><tbody></tbody></table>
@@ -291,7 +294,8 @@
         <div class="hint" id="cd-meta"></div>
         <div class="kpis" id="cd-stats" style="margin:14px 0"></div>
 
-        <h3>Leads</h3>
+        <h3>Leads <button id="cd-leads-btn" data-show="Show leads" data-hide="Hide leads" style="font-size:12px;margin-left:8px" onclick="toggleSection('cd-leads-wrap', this)">Show leads</button></h3>
+        <div id="cd-leads-wrap" style="display:none">
         <div class="bar">
           <label>State:</label> <select id="campstate"><option value="">All</option><option value="active">Active</option><option value="completed">Completed</option><option value="stopped_reply">Replied</option><option value="paused_manual">Paused</option><option value="skipped_existing">Skipped — existing connection</option><option value="archived">Archived</option></select>
         </div>
@@ -300,12 +304,13 @@
           <th onclick="sortCamp('company')">Company</th><th onclick="sortCamp('ai_score')">AI score ▾</th>
           <th onclick="sortCamp('stage')">Stage</th><th onclick="sortCamp('state')">State</th><th></th>
         </tr></thead><tbody></tbody></table>
+        </div>
 
         <h3>Responses</h3>
         <div id="cd-responses"></div>
 
-        <h3>Activity</h3>
-        <div id="cd-activity"></div>
+        <h3>Activity <button id="cd-activity-btn" data-show="See activity" data-hide="Hide activity" style="font-size:12px;margin-left:8px" onclick="toggleSection('cd-activity', this)">See activity</button></h3>
+        <div id="cd-activity" style="display:none"></div>
       </div>
     </div>
 
@@ -657,6 +662,12 @@
       j(`api/campaign/${id}/add-leads/`, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({list_id})})
         .then(r => { if(r.ok){ alert(`Added ${r.enrolled} leads (${r.skipped_duplicate} skipped — already in a campaign).`); loadCampaigns(); } else alert(r.error||"failed"); });
     };
+    window.toggleSection = (id, btn) => {
+      const el = document.getElementById(id);
+      const show = el.style.display === "none";
+      el.style.display = show ? "" : "none";
+      btn.textContent = show ? btn.dataset.hide : btn.dataset.show;
+    };
     window.closeCampaign = () => { document.getElementById("camplead-panel").style.display = "none"; };
     window.openCampaign = (id, name) => {
       document.getElementById("camplead-panel").style.display = "block";
@@ -665,6 +676,10 @@
       document.getElementById("cd-stats").innerHTML = "";
       document.getElementById("cd-responses").innerHTML = `<div class="hint">Loading…</div>`;
       document.getElementById("cd-activity").innerHTML = "";
+      document.getElementById("cd-leads-wrap").style.display = "none";
+      document.getElementById("cd-leads-btn").textContent = "Show leads";
+      document.getElementById("cd-activity").style.display = "none";
+      document.getElementById("cd-activity-btn").textContent = "See activity";
       document.getElementById("campstate").onchange = renderCampLeads;
       // Overview + stats + activity + responses
       j(`api/campaign/${id}/detail/`).then(d => {
