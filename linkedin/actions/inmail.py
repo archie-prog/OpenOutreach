@@ -99,6 +99,8 @@ def _compose_inmail(session, lead, subject: str, body: str):
 
     # A profile we can InMail shows a "Message" button. No button (within a short
     # wait) == no InMail capability for this lead — skip rather than hang.
+    from linkedin.browser.humanize import humanize_page
+    humanize_page(page)
     msg_btn = page.get_by_role("button", name="Message").first
     try:
         msg_btn.wait_for(state="visible", timeout=_AVAILABILITY_TIMEOUT_MS)

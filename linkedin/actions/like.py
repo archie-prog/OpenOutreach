@@ -128,6 +128,8 @@ def _like(session, lead) -> dict:
         except Exception:
             pass
 
+    from linkedin.browser.humanize import humanize_page
+    humanize_page(page)
     label = _reaction_label(page)
     if label is None:
         return {"success": False, "error": "no reaction button found (no recent post?)", "post_url": post_url}

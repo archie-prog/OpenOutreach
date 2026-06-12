@@ -515,6 +515,25 @@ def _log(session, state, step, action_type, target_url=""):
 # ── Template rendering ────────────────────────────────────────────────
 
 
+def _spin(text):
+    """Expand spintax: ``{a|b|c}`` -> one random choice, innermost-first so nesting
+    works. Leaves single-tag braces like ``{first_name}`` (no ``|``) untouched, so
+    each recipient gets a structurally different message (defeats NLP templating
+    detection)."""
+    import random
+    import re
+
+    pattern = re.compile(r"\{([^{}]*\|[^{}]*)\}")
+    guard = 0
+    while guard < 200:
+        m = pattern.search(text)
+        if not m:
+            break
+        text = text[:m.start()] + random.choice(m.group(1).split("|")) + text[m.end():]
+        guard += 1
+    return text
+
+
 def render_template(template: str, context: dict, fallback: str = "") -> str:
     """Render a template against ``context``. Supports both HeyReach-style
     ``{first_name}`` placeholders and Jinja ``{{ first_name }}``. Empty result
@@ -538,6 +557,7 @@ def render_template(template: str, context: dict, fallback: str = "") -> str:
             lambda m: str(context[m.group(1)]) if m.group(1) in context else m.group(0),
             text,
         )
+        text = _spin(text)
         rendered = text.strip()
     except Exception:
         return fallback
@@ -566,6 +586,8 @@ def send_connection_request(session, state, step):
     # The connect verb assumes the profile page is already open; this navigates
     # there. get_connection_status takes a profile dict, not the id string.
     get_connection_status(session, pdict)
+    from linkedin.browser.humanize import humanize_page
+    humanize_page(session.page)
     # If the step carries a personalised note, send WITH it via the app-side flow
     # (linkedin_cli's connect verb is note-less). Render placeholders first; fall
     # back to the note-less verb if the note is empty or the with-note flow fails.
@@ -625,6 +647,8 @@ def visit_profile(session, state):
     from linkedin_cli.actions.search import visit_profile as _visit
 
     _visit(session, {"public_identifier": state.lead.public_identifier, "url": state.lead.linkedin_url})
+    from linkedin.browser.humanize import humanize_page
+    humanize_page(session.page)
 
 
 def like_recent_post(session, state):

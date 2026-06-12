@@ -21,6 +21,37 @@ logger = logging.getLogger(__name__)
 LINKEDIN_FEED_URL = "https://www.linkedin.com/feed/"
 
 
+def _launch_fingerprinted(storage_state, account=None):
+    """Launch a stealthed browser with a consistent, region-correct fingerprint:
+    locale + timezone matched to the account and a fixed viewport. We deliberately
+    do NOT spoof the User-Agent/platform — a UA that disagrees with the real engine
+    is itself a detection signal — so we only fix the safe, high-signal bits."""
+    from playwright.sync_api import sync_playwright
+    try:
+        from playwright_stealth import Stealth
+    except Exception:
+        Stealth = None
+
+    tz = (getattr(account, "send_timezone", None) or "Europe/London")
+    playwright = sync_playwright().start()
+    browser = playwright.chromium.launch(headless=False)
+    context = browser.new_context(
+        storage_state=storage_state,
+        locale="en-GB",
+        timezone_id=tz,
+        viewport={"width": 1536, "height": 864},
+    )
+    context.set_default_timeout(30000)
+    context.set_default_navigation_timeout(30000)
+    if Stealth is not None:
+        try:
+            Stealth().apply_stealth_sync(context)
+        except Exception:
+            pass
+    page = context.new_page()
+    return page, context, browser, playwright
+
+
 def _save_cookies(session):
     """Persist Playwright storage state (cookies) to the DB."""
     state = session.context.storage_state()
@@ -52,7 +83,7 @@ def start_browser_session(session):
     if storage_state:
         logger.info("Loading saved session for %s", session)
 
-    session.page, session.context, session.browser, session.playwright = launch_browser(storage_state=storage_state)
+    session.page, session.context, session.browser, session.playwright = _launch_fingerprinted(storage_state, session.linkedin_profile)
 
     if not storage_state:
         _fresh_login(session)
@@ -96,7 +127,7 @@ def verify_account(profile):
 
     page = context = browser = playwright = None
     try:
-        page, context, browser, playwright = launch_browser(storage_state=cookie_data or None)
+        page, context, browser, playwright = _launch_fingerprinted(cookie_data or None, profile)
         if not cookie_data and profile.totp_secret:
             from linkedin.auth.login import login_with_totp, TwoFactorLoginError
 

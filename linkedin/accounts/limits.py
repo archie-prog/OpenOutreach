@@ -56,8 +56,37 @@ def daily_count(account, action_type, date=None) -> int:
     return row.count if row else 0
 
 
+def _week_start(d):
+    from datetime import timedelta
+    return d - timedelta(days=d.weekday())  # Monday of d's week
+
+
+def weekly_count(account, action_type, date=None) -> int:
+    """Actions of this type since Monday (the LinkedIn weekly-invite window)."""
+    from linkedin.models import AccountDailyCounter
+
+    date = date or timezone.now().date()
+    rows = AccountDailyCounter.objects.filter(
+        account=account, action_type=action_type,
+        date__gte=_week_start(date), date__lte=date,
+    )
+    return sum(r.count for r in rows)
+
+
+def weekly_cap_for(account, action_type) -> int:
+    """Weekly ceiling (0 = none). Only connects are weekly-capped today."""
+    if action_type == "connect":
+        return int(getattr(account, "connect_weekly_limit", 0) or 0)
+    return 0
+
+
 def has_capacity(account, action_type, date=None) -> bool:
-    return daily_count(account, action_type, date) < cap_for(account, action_type)
+    if daily_count(account, action_type, date) >= cap_for(account, action_type):
+        return False
+    wcap = weekly_cap_for(account, action_type)
+    if wcap and weekly_count(account, action_type, date) >= wcap:
+        return False  # weekly safety ceiling reached — frozen until Monday
+    return True
 
 
 def inmail_sent_this_month(account) -> int:

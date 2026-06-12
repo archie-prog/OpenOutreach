@@ -227,6 +227,10 @@ class LinkedInProfile(models.Model):
     subscribe_newsletter = models.BooleanField(default=True)
     active = models.BooleanField(default=True)
     connect_daily_limit = models.PositiveIntegerField(default=25)
+    # Weekly safety ceiling for connection requests, on top of the daily cap —
+    # once this many connects have gone out since Monday the account freezes for
+    # the rest of the week (LinkedIn enforces a ~100/week invite limit).
+    connect_weekly_limit = models.PositiveIntegerField(default=100)
     follow_up_daily_limit = models.PositiveIntegerField(default=25)
     legal_accepted = models.BooleanField(default=False)
     cookie_data = models.JSONField(null=True, blank=True)
