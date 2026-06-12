@@ -119,3 +119,27 @@ Useful evaluations: `navigator.webdriver`, `navigator.platform`, `navigator.lang
 - **CLAUDE.md rule:** never use the auto-memory system for this project; all context goes in CLAUDE.md/ARCHITECTURE.md/handovers.
 - Editing installed `linkedin_cli` files in the container is **non-durable** (lost on rebuild) — patch from app code instead.
 - The browser tests start `oo-worker`; with campaign 8 paused it does nothing against LinkedIn (empty schedule), so starting it briefly is safe — but **always stop it again**.
+
+---
+
+## UPDATE (later, same session) — items resolved + corrections
+
+**Anti-detection roadmap §4 is now resolved:**
+- **① GPU rendering — CLOSED, not achievable.** The laptop's GPUs are Ivy Bridge (2012, NO Vulkan) + an old AMD; modern Chromium ANGLE defaults to Vulkan → SwiftShader, and Xvfb's GLX path is software (llvmpipe). Tested 9 flag/driver combos; all fell to software or broke WebGL. **Mapped `/dev/dri/renderD128,129` into the `oo-worker` container** (recreated it — devices now present) and added GL flags (`--use-gl=angle --use-angle=gl`) so it uses **Mesa llvmpipe** (real Linux software stack) rather than SwiftShader. The fix was to make it **honest**: WebGL now truthfully reports the llvmpipe renderer (matching the actual canvas pixels), instead of stealth's incoherent Mac-GPU spoof. Real-GPU would need newer hardware or running on the laptop's real desktop X session (DISPLAY=:0) — deferred, not blocking. (commit f7abf8b)
+- **② Voyager headers — DONE.** `AccountSession.attach_voyager_capture()` listens to LinkedIn's own voyager/api requests and stores the live `x-li-track` (real clientVersion, e.g. 1.13.44770 — rotates ~monthly, captured not hardcoded) + `x-li-page-instance`; `launch._patch_voyager_headers()` monkeypatches `PlaywrightLinkedinAPI.__init__` to inject them. Verified end-to-end on Josh's session: our API client now sends x-li-track + x-li-page-instance + csrf-token + x-restli, matching the web client. (commit 3ebc228)
+- **③ CDP input-coordinate leak — SKIPPED (deliberate).** Research showed the OS-level-input fix (CDP-Patches/rebrowser) targets **Cloudflare/DataDome**, NOT LinkedIn; LinkedIn's stack is fingerprint+behavioural+Voyager+APFC. Low confirmed value for LinkedIn + high integration risk (routing all clicks through xdotool). Revisit only if concrete evidence emerges that LinkedIn checks `pageX==screenX`.
+- **④ Distribution refinements — DONE.** `humanize.py`: `type_humanly` (log-normal keystroke timing + occasional typo/correction) replaces uniform-delay typing; `_bezier_mouse` (curved path + jitter + variable velocity) replaces straight-line moves; `limits.next_action_at` jitter switched uniform→Gaussian (LinkedIn flags flat distributions). (commit 92b4b70)
+
+**Also committed after the original doc (all verified):**
+- `human_type` instead of `.fill()` for inmail/connect-note/TOTP-login inputs (instant injection was a tell). (aa774bc)
+- Launch Chromium WITHOUT automation switches: `--disable-blink-features=AutomationControlled` + `ignore_default_args=['--enable-automation']`. (aa774bc)
+- **Fingerprint COHERENCE — the biggest fix.** playwright_stealth was spoofing platform→Win32, languages→en-US, WebGL→Mac on this Linux/en-GB box, tripping FingerprintJS's getHasLiedOs/getHasLiedLanguages. `_COHERENCE_JS` (in `_launch_fingerprinted`) forces coherent Linux/en-GB values + deviceMemory=8 + honest llvmpipe WebGL, with getParameter.toString() preserved as native. (216b868 / f7abf8b)
+- Pacing now spreads connects RANDOMLY across 09:00–17:00 (wide jitter + ~8-min floor). (5a483e2)
+
+**Corrections to the original doc / earlier claims:**
+- **HeyReach was NOT banned — it is still running.** The "ban" claims were competitor "best HeyReach alternatives" FUD + a biased source. Their working model: cloud + **dedicated residential proxy per account** + real-browser behaviour + warm-up + human-scale limits + content variation. Valid blueprint.
+- **Egress IP CONFIRMED:** LinkedIn sees the **home residential IP 81.135.37.244** (UK BT), NOT Tailscale. No exit node; route is enp3s0→192.168.1.254; the container egresses the same IP. Tailscale only carries SSH. No proxy needed at 3 accounts; the real IP risk is **concurrent sessions** (an account used by its owner elsewhere while the kit runs it).
+- **Company-page-takedown vs account-ban are separate:** the former is LinkedIn enforcing ToS against a *visible automation vendor* (brand/legal); the latter is per-account *detection*. Good per-account anti-detection keeps customer accounts safe even if LinkedIn dislikes the vendor.
+- **Like action is confirmed fixed + verified** (really likes + re-reads reaction state to confirm). Zero current likes is only because the worker is stopped / aawilding restricted.
+
+**Still open:** recover aawilding (human, restricted); Toby login (TOTP/approval); onboarding flow (parked); assign Josh to a campaign; push branch (no creds). ~22 commits, local on `overhaul/grantgunner-hardening`.
