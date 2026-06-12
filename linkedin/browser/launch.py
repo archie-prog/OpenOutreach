@@ -79,3 +79,59 @@ def start_browser_session(session):
     # hanging the daemon for the duration of the browser timeout.
     session.page.wait_for_load_state("domcontentloaded")
     logger.info(colored("Browser ready", "green", attrs=["bold"]))
+
+
+def verify_account(profile):
+    """Non-blocking connection test for the onboarding UI. Returns (ok, error).
+
+    Uses the account's SAVED cookies (or a stored TOTP secret) only — it never
+    falls back to an interactive login that would block on a human 2FA challenge.
+    On a successful TOTP login it persists the fresh cookies."""
+    from linkedin_cli.browser.login import launch_browser, dismiss_comply_gate
+    from linkedin.auth.login import _is_authenticated, _url
+
+    cookie_data = profile.cookie_data
+    if not cookie_data and not profile.totp_secret:
+        return False, "No saved session — connect the account (enter the password and approve the login)."
+
+    page = context = browser = playwright = None
+    try:
+        page, context, browser, playwright = launch_browser(storage_state=cookie_data or None)
+        if not cookie_data and profile.totp_secret:
+            from linkedin.auth.login import login_with_totp, TwoFactorLoginError
+
+            class _Shim:
+                pass
+            shim = _Shim()
+            shim.page = page
+            shim.ensure_browser = lambda: None
+            try:
+                login_with_totp(shim, profile.linkedin_username, profile.linkedin_password, profile.totp_secret)
+            except TwoFactorLoginError as exc:
+                return False, "2FA login failed: %s" % (str(exc)[:200])
+            profile.cookie_data = context.storage_state()
+            profile.save(update_fields=["cookie_data"])
+            return True, ""
+
+        page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded")
+        try:
+            dismiss_comply_gate(page)
+        except Exception:
+            pass
+        try:
+            page.wait_for_timeout(2500)
+        except Exception:
+            pass
+        if _is_authenticated(_url(page)):
+            return True, ""
+        return False, "Session expired or invalid — reconnect the account."
+    except Exception as exc:
+        return False, str(exc)[:250]
+    finally:
+        try:
+            if browser:
+                browser.close()
+            if playwright:
+                playwright.stop()
+        except Exception:
+            pass

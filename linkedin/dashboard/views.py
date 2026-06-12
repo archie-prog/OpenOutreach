@@ -404,8 +404,26 @@ def api_accounts(request):
             "connect_random_enabled": a.connect_random_enabled,
             "connect_random_min": a.connect_random_min, "connect_random_max": a.connect_random_max,
             "connect_today": cap_for(a, "connect"),  # today's effective cap (random or fixed)
+            "last_verify_ok": a.last_verify_ok,
+            "last_verify_error": a.last_verify_error,
+            "verify_requested": a.verify_requested,
         })
     return JsonResponse({"accounts": out})
+
+
+@staff_member_required
+@require_POST
+def api_account_verify(request, account_id):
+    """Queue a connection test — the worker (which owns the browser) runs it
+    next cycle and writes the result back to the account."""
+    from linkedin.models import LinkedInProfile
+
+    prof = LinkedInProfile.objects.filter(pk=account_id).first()
+    if not prof:
+        return JsonResponse({"error": "not found"}, status=404)
+    prof.verify_requested = True
+    prof.save(update_fields=["verify_requested"])
+    return JsonResponse({"ok": True, "queued": True})
 
 
 @staff_member_required

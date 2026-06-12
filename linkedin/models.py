@@ -241,6 +241,14 @@ class LinkedInProfile(models.Model):
     # Base32 TOTP secret for native 2FA (Google Authenticator). Sensitive — when
     # set, login auto-fills the 6-digit code instead of waiting for a human.
     totp_secret = models.CharField(max_length=128, blank=True, default="")
+    # Connection-test state (onboarding UI). verify_requested is set by the
+    # dashboard "Test connection" button; the worker (which owns the browser)
+    # picks it up, checks the saved session authenticates, and writes the result
+    # back here. last_verify_ok: None = never tested, True = connected, False = failed.
+    verify_requested = models.BooleanField(default=False)
+    last_verified_at = models.DateTimeField(null=True, blank=True)
+    last_verify_ok = models.BooleanField(null=True)
+    last_verify_error = models.CharField(max_length=300, blank=True, default="")
     # Per-account sending schedule: messages/connects/etc. only go out inside this
     # local window, on these weekdays, optionally skipping bank holidays.
     send_start_hour = models.PositiveSmallIntegerField(default=9)   # inclusive, local

@@ -508,7 +508,7 @@
           const wd = a.send_weekdays || [0,1,2,3,4];
           const days = DAYS.map((lbl,i)=>`<label style="display:inline;margin-right:7px;font-size:12px"><input type="checkbox" ${wd.includes(i)?"checked":""} id="ac_wd_${a.id}_${i}"> ${lbl}</label>`).join("");
           return `<tr>
-          <td>${a.username}</td>
+          <td>${a.username}<div style="font-size:11px;margin-top:3px">${connStatus(a)} <button onclick="testConnection(${a.id})" style="font-size:11px;padding:1px 6px">Test connection</button></div></td>
           <td><input type="checkbox" ${a.active?"checked":""} id="ac_active_${a.id}"></td>
           <td><input type="checkbox" ${a.has_inmail?"checked":""} id="ac_inmail_${a.id}"></td>
           <td>${a.has_totp?"✓":"—"}</td>
@@ -537,6 +537,32 @@
         }).join("") || `<tr><td colspan="8">No accounts.</td></tr>`;
         checkConnectCaps();
       });
+    }
+    function connStatus(a){
+      if (a.verify_requested) return '<span style="color:#b45309">⏳ checking…</span>';
+      if (a.last_verify_ok === true) return '<span style="color:#166534;font-weight:600">✓ Connected</span>';
+      if (a.last_verify_ok === false) return `<span style="color:#b91c1c" title="${esc(a.last_verify_error||'')}">✗ ${esc(a.last_verify_error||'Not connected')}</span>`;
+      return '<span class="hint">not tested</span>';
+    }
+    window.testConnection = (id) => {
+      j(`api/account/${id}/verify/`, {method:"POST"}).then(r => {
+        if (!r.ok) { toast(r.error||"failed", "err"); return; }
+        toast("Testing connection… (up to ~90s)", "ok");
+        loadAccounts();
+        pollVerify(id, 0);
+      });
+    };
+    function pollVerify(id, n){
+      if (n > 45) { loadAccounts(); return; }
+      setTimeout(() => {
+        j("api/accounts/").then(d => {
+          const a = (d.accounts||[]).find(x => x.id === id);
+          if (a && !a.verify_requested) {
+            loadAccounts();
+            toast(a.last_verify_ok ? "✓ Connected" : ("✗ " + (a.last_verify_error||"Not connected")), a.last_verify_ok ? "ok" : "err");
+          } else { pollVerify(id, n+1); }
+        });
+      }, 3000);
     }
     window.onConnRandom = (id) => {
       const on = document.getElementById("ac_crand_"+id).checked;
@@ -592,7 +618,7 @@
       j("api/accounts/add/", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({
         username: gv("acc_email"), password: gv("acc_pw"), totp_secret: gv("acc_totp"),
         has_inmail: document.getElementById("acc_inmail").checked,
-      })}).then(r => { if(r.ok){ document.getElementById("acc_email").value=""; document.getElementById("acc_pw").value=""; document.getElementById("acc_totp").value=""; loadAccounts(); toast("Account added.", "ok"); } });
+      })}).then(r => { if(r.ok){ document.getElementById("acc_email").value=""; document.getElementById("acc_pw").value=""; document.getElementById("acc_totp").value=""; loadAccounts(); toast("Account added — testing connection…", "ok"); if (r.id) testConnection(r.id); } });
     };
 
     let CAMP_LEADS = [], CAMP_SORT = "ai_score", CAMP_DESC = true;

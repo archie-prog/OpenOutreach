@@ -35,6 +35,7 @@ urlpatterns = [
     path("api/accounts/", views.api_accounts, name="dashboard_api_accounts"),
     path("api/accounts/add/", views.api_account_add, name="dashboard_api_account_add"),
     path("api/account/<int:account_id>/", views.api_account_update, name="dashboard_api_account_update"),
+    path("api/account/<int:account_id>/verify/", views.api_account_verify, name="dashboard_api_account_verify"),
     path("api/campaigns/", views.api_campaigns, name="dashboard_api_campaigns"),
     path("api/campaigns/create/", views.api_campaign_create, name="dashboard_api_campaign_create"),
     path("api/campaign/<int:campaign_id>/update/", views.api_campaign_update, name="dashboard_api_campaign_update"),

@@ -61,6 +61,32 @@ class Command(BaseCommand):
             # web process (e.g. a freshly queued search or campaign edit).
             connection.close()
             try:
+                # Connection tests requested from the Accounts UI. verify_account
+                # starts its own Playwright, which must run in a FRESH thread — the
+                # worker's main thread already holds a sync-Playwright loop and
+                # nesting sync Playwright there raises "Sync API inside asyncio loop".
+                import threading
+                from django.utils import timezone as _tz
+                from linkedin.models import LinkedInProfile as _LP
+                from linkedin.browser.launch import verify_account
+                for _prof in _LP.objects.filter(verify_requested=True):
+                    _res = {}
+
+                    def _run(_p=_prof, _r=_res):
+                        _r["v"] = verify_account(_p)
+
+                    _t = threading.Thread(target=_run, daemon=True)
+                    _t.start()
+                    _t.join(timeout=150)
+                    _ok, _err = _res.get("v", (False, "verification timed out"))
+                    _prof.refresh_from_db(fields=["cookie_data"])  # TOTP verify may have saved cookies
+                    _prof.verify_requested = False
+                    _prof.last_verified_at = _tz.now()
+                    _prof.last_verify_ok = _ok
+                    _prof.last_verify_error = (_err or "")[:300]
+                    _prof.save(update_fields=["verify_requested", "last_verified_at", "last_verify_ok", "last_verify_error"])
+                    self.stdout.write(f"verified {_prof.linkedin_username}: ok={_ok} {_err}")
+
                 enrolled = enroll_active_campaigns()
 
                 # ── Per-account SENDING ─────────────────────────────────────
