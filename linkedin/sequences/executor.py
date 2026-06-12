@@ -138,7 +138,7 @@ def due_states(campaign=None):
         qs = qs.filter(campaign=campaign)
     # Highest AI fit first, so capped actions (esp. the ~15/mo InMails) are
     # spent on the best candidates.
-    return qs.select_related("current_step", "lead", "campaign").order_by("-lead__ai_score")
+    return qs.select_related("current_step", "lead", "campaign", "campaign__sending_account").order_by("-lead__ai_score")
 
 
 def run_due_states(session, campaign=None, limit=None) -> int:
@@ -155,6 +155,52 @@ def run_due_states(session, campaign=None, limit=None) -> int:
             logger.exception("Sequence step failed for %s", state)
             _set_state(state, LeadCampaignState.State.STOPPED_ERROR)
     return count
+
+
+
+def due_states_by_account(fallback_profile):
+    """Group every due state by the LinkedIn account that should send it — its
+    campaign's ``sending_account``, or *fallback_profile* when unset. Returns a
+    list of ``(profile, [states])``, preserving the ai-score order within each
+    account so capped actions still favor the best leads."""
+    groups = {}  # pk -> [profile, [states]]
+    for st in due_states():
+        acct = st.campaign.sending_account or fallback_profile
+        if acct is None:
+            continue
+        if acct.pk not in groups:
+            groups[acct.pk] = [acct, []]
+        groups[acct.pk][1].append(st)
+    return [(prof, states) for prof, states in groups.values()]
+
+
+def run_states(session, states) -> int:
+    """Advance a specific list of due states under *session*. Returns how many
+    advanced; a step that raises drops that state to STOPPED_ERROR (as in
+    run_due_states), so one bad lead never halts the rest."""
+    count = 0
+    for state in states:
+        try:
+            advance_state(session, state)
+            count += 1
+        except Exception:
+            logger.exception("Sequence step failed for %s", state)
+            _set_state(state, LeadCampaignState.State.STOPPED_ERROR)
+    return count
+
+
+def active_sending_accounts(fallback_profile):
+    """Distinct accounts to service this cycle: the sending_account of every
+    ACTIVE campaign (fallback_profile when unset). Drives per-account reply
+    polling even for accounts with no due state right now."""
+    from linkedin.models import Campaign
+
+    accts = {}
+    for c in Campaign.objects.filter(status=Campaign.Status.ACTIVE).select_related("sending_account"):
+        a = c.sending_account or fallback_profile
+        if a is not None:
+            accts.setdefault(a.pk, a)
+    return list(accts.values())
 
 
 _STEP_ACTION = {

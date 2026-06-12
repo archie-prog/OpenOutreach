@@ -111,6 +111,13 @@ class Campaign(models.Model):
     # intentional list of existing contacts (you accept they may have been
     # messaged before). See the connection-provenance guard in sequences/executor.
     include_current_network = models.BooleanField(default=False)
+    # Which LinkedIn account sends for this campaign. Null = the worker's
+    # default (first active account) - preserves single-account behavior for
+    # campaigns created before multi-account support.
+    sending_account = models.ForeignKey(
+        "linkedin.LinkedInProfile", null=True, blank=True,
+        on_delete=models.SET_NULL, related_name="sending_campaigns",
+    )
 
     def __str__(self):
         return self.name
