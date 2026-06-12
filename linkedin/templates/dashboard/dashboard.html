@@ -899,7 +899,7 @@
         if (!d.threads.length){ list.innerHTML = `<div class="hint" style="padding:16px">No conversations yet.</div>`; return; }
         list.innerHTML = d.threads.map(t => `
           <div class="threadrow ${t.unread?"unread":""} ${t.id===CUR_THREAD?"sel":""}" onclick="openThread(${t.id})">
-            <div class="nm">${t.unread?'<span class="dot"></span>':""}${esc(t.lead_name)} <span class="acctbadge" title="LinkedIn account">${esc(t.account_name)}</span></div>
+            <div class="nm">${t.unread?'<span class="dot"></span>':""}${esc(t.lead_name)} <span class="acctbadge" title="LinkedIn account">${esc(t.account_name)}</span><button onclick="event.stopPropagation();archiveThread(${t.id}, true)" title="Hide conversation & exclude from stats" style="float:right;border:none;background:none;cursor:pointer;color:#9ca3af;font-size:12px">✕ Hide</button></div>
             <div class="pre">${t.last_direction==="out"?"You: ":""}${esc(t.last_message||"")}</div>
           </div>`).join("");
       });
@@ -929,7 +929,7 @@
       j(`api/inbox/thread/${id}/archive/`, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({archived})})
         .then(r => {
           if (!r.ok) return;
-          toast(archived ? "Conversation archived" : "Conversation unarchived", "ok");
+          toast(archived ? "Conversation hidden — removed from dashboard stats" : "Conversation restored", "ok");
           // If we just archived the open thread, clear the convo pane; refresh the list.
           if (archived && CUR_THREAD === id) { document.getElementById("convo").innerHTML = `<div class="hint" style="padding:16px">Select a conversation.</div>`; CUR_THREAD = null; }
           loadThreads();

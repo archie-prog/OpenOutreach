@@ -43,6 +43,24 @@ def dashboard_page(request):
     })
 
 
+def _archived_action_exclude_q():
+    """Q matching ActionLogs that belong to a HIDDEN (archived) Unibox
+    conversation, so dashboard stats can exclude them. Pair-precise on
+    (lead, account); returns None when nothing is archived."""
+    from django.db.models import Q
+    from linkedin.models import MessageThread
+
+    cond = Q()
+    has = False
+    for lid, aid in MessageThread.objects.filter(
+        archived_at__isnull=False
+    ).values_list("lead_id", "account_id"):
+        if lid is not None and aid is not None:
+            cond |= Q(lead_id=lid, linkedin_profile_id=aid)
+            has = True
+    return cond if has else None
+
+
 @staff_member_required
 def api_kpi_timeseries(request):
     """Per-bucket counts (connections/messages/inmails/replies) for the chart.
@@ -77,10 +95,13 @@ def api_kpi_timeseries(request):
         base = base.filter(campaign_id=campaign)
     if account:
         base = base.filter(linkedin_profile_id=account)
+    excl = _archived_action_exclude_q()
+    if excl:
+        base = base.exclude(excl)
     connects = series(base.filter(action_type="connect"), "created_at")
     messages = series(base.filter(action_type="message"), "created_at")
     inmails = series(base.filter(action_type="inmail"), "created_at")
-    rep_qs = Message.objects.filter(direction="in", thread__contacted_by_tool=True)
+    rep_qs = Message.objects.filter(direction="in", thread__contacted_by_tool=True, thread__archived_at__isnull=True)
     if campaign:
         rep_qs = rep_qs.filter(thread__lead__campaign_states__campaign_id=campaign)
     if account:
@@ -1243,6 +1264,7 @@ def api_kpis(request):
     campaign = request.GET.get("campaign") or None
     account = request.GET.get("account") or None
     since = timezone.now() - timedelta(days=days) if days else None
+    excl = _archived_action_exclude_q()
 
     def actions(t):
         q = ActionLog.objects.filter(action_type=t)
@@ -1252,6 +1274,8 @@ def api_kpis(request):
             q = q.filter(campaign_id=campaign)
         if account:
             q = q.filter(linkedin_profile_id=account)
+        if excl:
+            q = q.exclude(excl)
         return q.count()
 
     def states(s):
@@ -1261,7 +1285,7 @@ def api_kpis(request):
         return q.count()
 
     # Replies to OUR outreach only — threads this tool messaged.
-    replies_q = MessageThread.objects.filter(contacted_by_tool=True, messages__direction="in")
+    replies_q = MessageThread.objects.filter(contacted_by_tool=True, archived_at__isnull=True, messages__direction="in")
     if since:
         replies_q = replies_q.filter(messages__direction="in", messages__sent_at__gte=since)
     if campaign:
@@ -1311,6 +1335,9 @@ def api_activity(request):
         qs = qs.filter(linkedin_profile_id=account)
     if atype:
         qs = qs.filter(action_type=atype)
+    excl = _archived_action_exclude_q()
+    if excl:
+        qs = qs.exclude(excl)
 
     out = [
         {
