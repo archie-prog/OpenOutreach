@@ -517,12 +517,12 @@ def api_account_update(request, account_id):
 
 @staff_member_required
 def api_campaigns(request):
-    from linkedin.models import Campaign
+    from linkedin.models import Campaign, LinkedInProfile
 
     out = []
     qs = Campaign.objects.filter(sequence__isnull=False).exclude(
         status=Campaign.Status.ARCHIVED
-    ).select_related("sequence", "lead_list").order_by("-id")
+    ).select_related("sequence", "lead_list", "sending_account").order_by("-id")
     for c in qs:
         out.append({
             "id": c.pk,
@@ -534,8 +534,14 @@ def api_campaigns(request):
             "lead_list_id": c.lead_list_id,
             "leads": c.lead_states.count(),
             "include_current_network": c.include_current_network,
+            "sending_account_id": c.sending_account_id,
+            "sending_account": c.sending_account.linkedin_username if c.sending_account else "",
         })
-    return JsonResponse({"campaigns": out})
+    accounts = [
+        {"id": a.pk, "name": a.linkedin_username}
+        for a in LinkedInProfile.objects.filter(active=True).order_by("id")
+    ]
+    return JsonResponse({"campaigns": out, "accounts": accounts})
 
 
 @staff_member_required
@@ -562,6 +568,7 @@ def api_campaign_create(request):
         campaign = Campaign.objects.create(
             name=name, sequence_id=sequence_id, lead_list_id=lead_list_id, status=status,
             include_current_network=bool(payload.get("include_current_network")),
+            sending_account_id=payload.get("sending_account_id") or None,
         )
     except IntegrityError:
         return JsonResponse({"error": "a campaign with that name already exists"}, status=400)
@@ -609,6 +616,8 @@ def api_campaign_update(request, campaign_id):
         campaign.lead_list_id = payload["lead_list_id"] or None; updates.append("lead_list")
     if "include_current_network" in payload:
         campaign.include_current_network = bool(payload["include_current_network"]); updates.append("include_current_network")
+    if "sending_account_id" in payload:
+        campaign.sending_account_id = payload["sending_account_id"] or None; updates.append("sending_account")
 
     status = payload.get("status")
     enrolled = 0
@@ -729,6 +738,8 @@ def api_campaign_detail(request, campaign_id):
         "sequence": c.sequence.name if c.sequence else "",
         "lead_list": c.lead_list.name if c.lead_list else "",
         "include_current_network": c.include_current_network,
+        "sending_account": c.sending_account.linkedin_username if c.sending_account else "",
+        "sending_account_id": c.sending_account_id,
         "stats": {
             "enrolled": sum(state_counts.values()),
             "active": state_counts.get("active", 0),
