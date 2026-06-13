@@ -164,6 +164,9 @@ def start_browser_session(session):
     # beacons, lazy media) and on LinkedIn that event may never fire,
     # hanging the daemon for the duration of the browser timeout.
     session.page.wait_for_load_state("domcontentloaded")
+    # An HTTP-200 "account restricted" checkpoint slips past auth handling —
+    # catch it here so the worker auto-pauses instead of acting on a flagged account.
+    session.assert_not_restricted()
     logger.info(colored("Browser ready", "green", attrs=["bold"]))
 
 
@@ -208,6 +211,10 @@ def verify_account(profile):
             page.wait_for_timeout(2500)
         except Exception:
             pass
+        from linkedin.browser.session import detect_restriction
+        _restricted = detect_restriction(page)
+        if _restricted:
+            return False, "LinkedIn has restricted this account: %s" % _restricted
         if _is_authenticated(_url(page)):
             return True, ""
         return False, "Session expired or invalid — reconnect the account."

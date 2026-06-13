@@ -20,6 +20,37 @@ def random_sleep(min_val, max_val):
     time.sleep(delay)
 
 
+# Phrases LinkedIn shows on its "account restricted" / automation-detected
+# checkpoint page. That page returns HTTP 200 (NOT a 401), so it slips past
+# auth-error handling — we detect it by wording and stop, instead of hammering
+# a flagged account (the aawilding incident: days of connects on a restricted
+# session). Kept deliberately narrow so a normal 2FA challenge never matches.
+RESTRICTION_MARKERS = (
+    "temporarily restricted",
+    "we've restricted your account",
+    "we have restricted your account",
+    "your account has been restricted",
+    "detected the use of software that automates",
+    "restricted your account until",
+)
+
+
+def detect_restriction(page):
+    """Return a short reason string if ``page`` is LinkedIn's restriction /
+    automation-checkpoint page, else None. Never raises."""
+    if page is None:
+        return None
+    try:
+        body = (page.inner_text("body") or "").lower()
+    except Exception:
+        return None
+    for m in RESTRICTION_MARKERS:
+        if m in body:
+            i = body.find(m)
+            return body[max(0, i - 40):i + 130].strip().replace("\n", " ")
+    return None
+
+
 class AccountSession:
     def __init__(self, linkedin_profile):
         self.linkedin_profile = linkedin_profile
@@ -93,6 +124,20 @@ class AccountSession:
             start_browser_session(session=self)
         else:
             self._maybe_refresh_cookies()
+
+    def assert_not_restricted(self):
+        """Raise AuthenticationError if the current page is LinkedIn's restriction
+        checkpoint (HTTP 200 — not a 401, so nothing else catches it). Lets the
+        worker auto-pause a flagged account instead of continuing to act on it."""
+        reason = detect_restriction(self.page)
+        if not reason:
+            return
+        try:
+            from linkedin_cli.exceptions import AuthenticationError
+        except Exception:
+            class AuthenticationError(Exception):
+                pass
+        raise AuthenticationError("LinkedIn restriction/checkpoint page: %s" % reason)
 
     @cached_property
     def self_profile(self) -> dict:

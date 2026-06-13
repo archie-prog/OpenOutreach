@@ -51,6 +51,7 @@ class Command(BaseCommand):
                 raise RuntimeError("no saved session and no TOTP secret — needs a one-time manual login")
             session = get_or_create_session(acct)
             session.ensure_browser()
+            session.assert_not_restricted()  # HTTP-200 restriction page → AuthenticationError → auto_pause
             return session
 
         def auto_pause(prof, reason):
