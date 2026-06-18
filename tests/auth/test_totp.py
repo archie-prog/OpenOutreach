@@ -63,6 +63,11 @@ class _FakeLocator:
     def fill(self, value):
         self.page.filled.append((self.kind, value))
 
+    def type(self, text, delay=None):
+        # The login path types via linkedin_cli.human_type, which calls
+        # locator.type(text, delay=...). Record it keyed by the locator's selector.
+        self.page.filled.append((self.kind, text))
+
     def click(self):
         self.page.clicked.append(self.kind)
         self.page.on_click(self.kind)
@@ -93,6 +98,12 @@ class _FakePage:
     # — interaction —
     def fill(self, selector, value):
         self.filled.append((selector, value))
+
+    def locator(self, selector):
+        # login.py now types into locators (human_type(page.locator("#username"), …))
+        # rather than calling page.fill(selector, …). The fake locator records the
+        # typed text under its selector so the credential assertions still hold.
+        return _FakeLocator(self, selector)
 
     def get_by_role(self, role, name=None):
         if role == "button":

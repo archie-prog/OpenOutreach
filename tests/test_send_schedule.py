@@ -48,6 +48,9 @@ def test_pacing_ahead_defers_to_slot(monkeypatch):
 
     a = _account(daily_caps_json={"connect": 8})  # 8h window / 8 = 1h spacing
     monkeypatch.setattr(limits, "is_send_time", lambda acc, dt=None: True)
+    # Zero the (now heavy-tailed) jitter so this test pins the schedule-ANCHOR
+    # behaviour deterministically; jitter spread is covered separately.
+    monkeypatch.setattr(limits, "_heavy_tailed_jitter", lambda spacing: 0.0)
     # Window opened ~30 min ago; we've already sent 3 → next slot is far ahead.
     monkeypatch.setattr(limits, "_window_open_today", lambda acc, now: now - timedelta(minutes=30))
     monkeypatch.setattr(limits, "daily_count", lambda acc, at, date=None: 3)
@@ -92,3 +95,15 @@ def test_blank_step_resumes_to_next(fake_session):
     st.refresh_from_db()
     # Blank does nothing but advances the cursor to the next step (resumes).
     assert st.current_step_id == nxt.pk
+
+
+def test_heavy_tailed_jitter_within_envelope_and_spread():
+    """Jitter stays inside +/-3*spacing (clamp), is heavy-tailed (some draws exceed
+    1*spacing — impossible under the old clamp), spread, and ~zero-mean (symmetric,
+    so it doesn't shift the schedule anchor / under-send)."""
+    spacing = 1000.0
+    vals = [limits._heavy_tailed_jitter(spacing) for _ in range(4000)]
+    assert all(-3 * spacing <= v <= 3 * spacing for v in vals)  # within the clamp
+    assert any(abs(v) > spacing for v in vals)                  # heavy tail (beyond old +/-1)
+    assert len({round(v) for v in vals}) > 50                   # varied, not constant
+    assert abs(sum(vals) / len(vals)) < spacing * 0.15          # ~zero-mean (symmetric)

@@ -282,6 +282,24 @@ def _window_open_today(account, now):
     return local.replace(hour=account.send_start_hour, minute=0, second=0, microsecond=0)
 
 
+def _heavy_tailed_jitter(spacing) -> float:
+    """Jitter (seconds) for a send's scheduled slot: a Laplace draw, scale 0.6,
+    clamped to ±3·spacing. Heavy-tailed (mostly small, occasionally a long gap) —
+    the human shape LinkedIn's distribution scoring expects, vs the old
+    clamped-Gaussian's tight central cluster. It is SYMMETRIC around the
+    self-correcting schedule anchor (slot = win_open + sent·spacing), so the mean
+    is unchanged and the day still targets ~cap sends — no systematic under-send.
+    The min_gap floor in next_action_at still bars bursts; is_send_time keeps it in
+    the window (a rare draw past window-end just spills to the next working day).
+    Inverse-CDF; the log arg is floored so a 0.0 draw can't domain-error."""
+    import math
+    import random
+
+    u = random.random() - 0.5
+    laplace = -math.copysign(1.0, u) * math.log(max(1e-9, 1.0 - 2.0 * abs(u)))
+    return max(-3.0, min(3.0, 0.6 * laplace)) * spacing
+
+
 def next_action_at(account, action_type):
     """When this account may next perform ``action_type``.
 
@@ -291,7 +309,6 @@ def next_action_at(account, action_type):
     catches up toward the cap rather than drifting, while a ``min_gap`` floor keeps
     catch-up a steady recovery, never an instant burst. Never sends outside the
     window. ``<= now`` means 'go now'."""
-    import random
     from datetime import timedelta
 
     from linkedin.conf import ENABLE_ACTION_PACING
@@ -313,10 +330,10 @@ def next_action_at(account, action_type):
     slot = win_open + timedelta(seconds=sent * spacing)
     # WIDE jitter so sends land at irregular, human times across 09:00-17:00 —
     # not a metronomic ~19-min drumbeat. The min-gap floor below still prevents
-    # any burst, and is_send_time keeps everything inside the window.
-    # Gaussian (bell-shaped) jitter, clamped — NOT uniform: LinkedIn's anti-abuse
-    # explicitly flags flat/uniform inter-action distributions.
-    slot += timedelta(seconds=max(-1.0, min(1.0, random.gauss(0, 0.5))) * spacing)
+    # any burst, and is_send_time keeps everything inside the window. Heavy-tailed
+    # (Laplace), NOT clamped-Gaussian/uniform: LinkedIn scores the SHAPE of the
+    # inter-action gap distribution, and human gaps are heavy-tailed.
+    slot += timedelta(seconds=_heavy_tailed_jitter(spacing))
     if slot < win_open:
         slot = win_open
 

@@ -143,3 +143,61 @@ Useful evaluations: `navigator.webdriver`, `navigator.platform`, `navigator.lang
 - **Like action is confirmed fixed + verified** (really likes + re-reads reaction state to confirm). Zero current likes is only because the worker is stopped / aawilding restricted.
 
 **Still open:** recover aawilding (human, restricted); Toby login (TOTP/approval); onboarding flow (parked); assign Josh to a campaign; push branch (no creds). ~22 commits, local on `overhaul/grantgunner-hardening`.
+
+
+---
+
+## ADDENDUM 2026-06-17 — Independent detection research (adversarially verified)
+
+Independent deep-research pass (multi-source; 18 claims confirmed / 7 killed via 3-vote adversarial
+verification). Confidence tags: **[E]** established/primary · **[C]** corroborated multi-vendor · **[S]**
+speculative / single-vendor FUD.
+
+### Core model
+- LinkedIn's defence is a **first-party behavioural-ML + account-graph stack (CASAL)**, NOT an off-the-shelf
+  Cloudflare/DataDome bot-wall. **[E]** Design against behavioural/graph ML, not just JS fingerprint evasion.
+  **Never treat an HTTP-200 as "not detected"** — nearline scoring can flag seconds-to-minutes later.
+- Ensemble: logistic regression, XGBoost, isolation forest, sequence models (LSTM), GNN; a multi-stage "funnel
+  of defences" — surviving login proves nothing; the durable risk is **post-login behavioural anomaly scoring**. **[E]**
+- Behavioural ML is the decisive vector: it models the **SHAPE of behaviour distributions** and the
+  **ORDER + TIMING of request sequences** (LSTM over request-path tokens + concatenated inter-request
+  time-deltas; ratio/log distribution-shape). Automation is flagged for being "more homogenous" than
+  heterogeneous human activity — **even at low/slow volume**. **[E]**
+
+### Build rules (ranked by detection-risk reduction)
+1. **Per-account NETWORK + FINGERPRINT isolation** — highest impact (conservative inference: the specific
+   "cluster on shared IP/fingerprint, score per-cluster" mechanism was NOT confirmed — only the GNN/isolation-
+   forest *capability* is [E]). One residential/mobile egress IP per account (never datacenter, never one IP
+   for all); per-account **differentiated but coherent** fingerprint at the **real browser-profile/GPU level**
+   (NOT JS overrides — those create `getHasLiedOs` incoherence = worse); never concurrent/overlapping sessions;
+   keep each account's IP+fingerprint stable over time.
+2. **Human-heterogeneous behaviour** **[E]** — no fixed intervals / regular cadence; **heavy-tailed
+   (exponential/log-normal) inter-action delays, NOT Gaussian, NOT uniform**; vary action TYPE and ORDER per
+   session; circadian/weekend rhythms. Slowing down alone is useless — distribution shape + sequence
+   homogeneity are what get scored.
+3. **Same-origin in-page Voyager** **[E]** (already done) — live `x-li-track`/`x-li-page-instance`/`csrf-token`
+   browser-native; JA3/TLS/HTTP2 matches real Chromium; never an external HTTP client.
+4. **Patched runtime** (table-stakes hygiene, low LinkedIn-specificity) — Patchright / rebrowser-patched
+   Playwright; strip `__pwInitScripts`/`__playwright__binding__`; `navigator.webdriver=false`; no
+   `exposeFunction` / main-world eval.
+5. **Stay under rate/acceptance limits** (specific numbers unverified).
+
+### What the research KILLED (do NOT over-invest)
+- CDP `Runtime.enable`/console "5 lines of JS" + `Error.stack`-getter detection tricks — **REFUTED (0-3)**;
+  Google's May-2025 V8 patches broke them. The "90% of blocks = CDP leaks / all vendors use them" figure is
+  uncited single-vendor FUD, partly self-contradicted by DataDome.
+- "LinkedIn internally runs APFC/DNA, 48 traits, RSA header on every request" (ppc.land framing) —
+  **REFUTED (0-3)** as framed. Field *collection* is corroborated **[C]**; enforcement *use* is contested.
+- "LinkedIn clusters accounts on shared IP/fingerprint and scores per-cluster" — **NOT confirmed (1-2 split)**.
+  This is the core question for a multi-account/one-IP build and remains OPEN.
+
+### Implications for this kit
+- The **serialize worker patch (2026-06-17)** already removes the concurrent-session sub-risk of rule 1.
+- Rule 1's remainder (per-account IP + real fingerprint) is the top lever → **master/satellite architecture**
+  (each account on its own laptop = own home ISP + real-hardware coherent fingerprint) is the correct fix,
+  superior to proxies. [design in progress]
+- Rule 2 → switch `accounts/limits.py::next_action_at` jitter from clamped-Gaussian to heavy-tailed. [queued]
+
+Primary sources: LinkedIn engineering blog (CASAL 2023; defending-against-abuse 2018; automated-fake-account-
+detection 2018; behavior-analytic-computation 2021; isolation-forest), Castle / DataDome / rebrowser
+maintainers, BleepingComputer (APFC/BrowserGate).

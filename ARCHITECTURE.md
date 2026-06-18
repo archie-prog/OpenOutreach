@@ -121,7 +121,7 @@ Three apps in `INSTALLED_APPS`:
 - **`setup/seeds.py`** — User-provided seed profiles: parse URLs, create Leads + QUALIFIED Deals.
 - **`management/setup_crm.py`** — Idempotent CRM bootstrap (Site creation).
 - **`admin.py`** — Django Admin: SiteConfig, Campaign, LinkedInProfile, ActionLog.
-- **`django_settings.py`** — Django settings (SQLite at `data/db.sqlite3`). Apps: crm, chat, linkedin.
+- **`django_settings.py`** — Django settings (SQLite at `data/db.sqlite3`). Apps: crm, chat, linkedin. The SQLite `OPTIONS` enable **WAL + `synchronous=NORMAL` + `transaction_mode=IMMEDIATE` + `busy_timeout=30s`** because two processes write the file (oo-web + the multi-threaded runserver, and oo-worker): WAL lets readers run alongside the single writer, IMMEDIATE serializes the two writers cleanly, and the timeout makes a contended writer wait instead of erroring "database is locked".
 
 
 ## `linkedin_cli` — Standalone LinkedIn Library (Django-free)

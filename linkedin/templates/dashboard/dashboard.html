@@ -623,7 +623,7 @@
       })}).then(r => { if(r.ok){ document.getElementById("acc_email").value=""; document.getElementById("acc_pw").value=""; document.getElementById("acc_totp").value=""; loadAccounts(); toast("Account added — testing connection…", "ok"); if (r.id) testConnection(r.id); } });
     };
 
-    let CAMP_LEADS = [], CAMP_SORT = "ai_score", CAMP_DESC = true;
+    let CAMP_LEADS = [], CAMP_SORT = "ai_score", CAMP_DESC = true, CAMP_MAX_ATTEMPTS = 4;
     let ALL_CAMPS = [], ALL_LISTS = [], ALL_ACCOUNTS = [];
     const STATUS_LABEL = { draft:"Draft", active:"Active", paused:"Paused", completed:"Completed", archived:"Archived" };
     function loadCampaigns(){
@@ -734,7 +734,7 @@
           : `<div class="hint">No activity yet.</div>`;
       });
       // Leads table
-      j(`api/campaign/${id}/leads/`).then(d => { CAMP_LEADS = d.leads; renderCampLeads(); });
+      j(`api/campaign/${id}/leads/`).then(d => { CAMP_LEADS = d.leads; CAMP_MAX_ATTEMPTS = d.max_attempts || 4; renderCampLeads(); });
       document.getElementById("camplead-panel").scrollIntoView({behavior:"smooth"});
     };
     window.sortCamp = (k) => { if (CAMP_SORT===k) CAMP_DESC = !CAMP_DESC; else { CAMP_SORT = k; CAMP_DESC = (k==="ai_score"); } renderCampLeads(); };
@@ -744,7 +744,13 @@
       rows.sort((a,b) => { let x=a[CAMP_SORT], y=b[CAMP_SORT]; if(x==null)x=(CAMP_SORT==="ai_score"?-1:""); if(y==null)y=(CAMP_SORT==="ai_score"?-1:""); return (x<y?-1:x>y?1:0)*(CAMP_DESC?-1:1); });
       document.querySelector("#campleads tbody").innerHTML = rows.map(l => `<tr>
         <td><a href="#" onclick="openLeadHistory(${l.id});return false">${esc(l.lead_name)}</a></td><td>${esc((l.title||"").slice(0,45))}</td><td>${esc((l.company||"").slice(0,25))}</td>
-        <td>${l.ai_score==null?"—":l.ai_score}</td><td>${esc(l.stage)}</td><td>${esc(l.state)}</td>
+        <td>${l.ai_score==null?"—":l.ai_score}</td><td>${esc(l.stage)}</td><td>${
+          l.state==="stopped_error" && l.last_error
+            ? `<span style="color:#c0392b" title="${esc(l.last_error)}">${esc(l.state)} ⚠︎</span>`
+            : (l.error_count > 0 && l.last_error
+                ? `<span style="color:#e67e22" title="attempt ${l.error_count}/${CAMP_MAX_ATTEMPTS}: ${esc(l.last_error)}">${esc(l.state)} ↻</span>`
+                : esc(l.state))
+        }</td>
         <td><a href="${esc(l.lead_url)}" target="_blank">↗</a></td></tr>`).join("") || `<tr><td colspan="7">No leads in this campaign.</td></tr>`;
     }
 

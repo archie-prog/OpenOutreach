@@ -70,6 +70,22 @@ DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
         "NAME": str(ROOT_DIR / "data" / "db.sqlite3"),
+        # Two processes write this SQLite file (oo-web + oo-worker) and runserver
+        # is multi-threaded, so the default rollback journal hits "database is
+        # locked". WAL lets readers run concurrently with the single writer;
+        # synchronous=NORMAL is the safe/fast pairing with WAL; busy_timeout (also
+        # via Django's `timeout`) makes a contended writer wait instead of erroring;
+        # IMMEDIATE transactions take the write lock at BEGIN so two writers
+        # serialize cleanly rather than deadlocking part-way through a transaction.
+        "OPTIONS": {
+            "timeout": 30,
+            "transaction_mode": "IMMEDIATE",
+            "init_command": (
+                "PRAGMA journal_mode=WAL;"
+                "PRAGMA synchronous=NORMAL;"
+                "PRAGMA busy_timeout=30000;"
+            ),
+        },
     }
 }
 

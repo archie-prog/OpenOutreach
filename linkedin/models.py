@@ -474,6 +474,14 @@ class LeadCampaignState(models.Model):
     )
     next_action_due_at = models.DateTimeField(null=True, blank=True, db_index=True)
     last_action_at = models.DateTimeField(null=True, blank=True)
+    # Transient-failure tracking. A step that raises is retried with backoff a few
+    # times (error_count climbs) before the lead is parked as STOPPED_ERROR — so
+    # one Playwright timeout no longer permanently bricks a lead. Reset to 0 on the
+    # next successful step. last_error/last_error_at are surfaced in the dashboard
+    # so a stalled or parked lead is visible (was: silently invisible).
+    error_count = models.PositiveSmallIntegerField(default=0)
+    last_error = models.TextField(blank=True, default="")
+    last_error_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(default=timezone.now)
 
     class Meta:

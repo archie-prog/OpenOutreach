@@ -63,47 +63,58 @@ def _launch_fingerprinted(storage_state, account=None):
 
     tz = (getattr(account, "send_timezone", None) or "Europe/London")
     playwright = sync_playwright().start()
-    # Hide the automation switches: drop --enable-automation (which sets
-    # navigator.webdriver + the 'controlled by automated software' infobar) and
-    # disable the AutomationControlled blink feature. Stealth covers the JS side.
-    browser = playwright.chromium.launch(
-        headless=False,
-        args=[
-            "--disable-blink-features=AutomationControlled",
-            # Real GPU rendering (needs /dev/dri/renderD128 mapped into the
-            # container) so WebGL/canvas are not software SwiftShader — which the
-            # deep fingerprint/APFC collector reads as virtualized.
-            "--use-gl=angle",
-            "--use-angle=gl",
-            "--ignore-gpu-blocklist",
-            "--enable-gpu-rasterization",
-            "--no-sandbox",
-            "--disable-gpu-sandbox",
-        ],
-        ignore_default_args=["--enable-automation"],
-    )
-    context = browser.new_context(
-        storage_state=storage_state,
-        locale="en-GB",
-        timezone_id=tz,
-        viewport={"width": 1536, "height": 864},
-    )
-    context.set_default_timeout(30000)
-    context.set_default_navigation_timeout(30000)
-    if Stealth is not None:
+    # If anything after .start() fails, stop the just-started Playwright so a
+    # failed launch never orphans a live sync loop on the worker's main thread —
+    # which, under the serialize worker, would block every other account's browser
+    # launch until the worker restarts.
+    try:
+        # Hide the automation switches: drop --enable-automation (which sets
+        # navigator.webdriver + the 'controlled by automated software' infobar) and
+        # disable the AutomationControlled blink feature. Stealth covers the JS side.
+        browser = playwright.chromium.launch(
+            headless=False,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                # Real GPU rendering (needs /dev/dri/renderD128 mapped into the
+                # container) so WebGL/canvas are not software SwiftShader — which the
+                # deep fingerprint/APFC collector reads as virtualized.
+                "--use-gl=angle",
+                "--use-angle=gl",
+                "--ignore-gpu-blocklist",
+                "--enable-gpu-rasterization",
+                "--no-sandbox",
+                "--disable-gpu-sandbox",
+            ],
+            ignore_default_args=["--enable-automation"],
+        )
+        context = browser.new_context(
+            storage_state=storage_state,
+            locale="en-GB",
+            timezone_id=tz,
+            viewport={"width": 1536, "height": 864},
+        )
+        context.set_default_timeout(30000)
+        context.set_default_navigation_timeout(30000)
+        if Stealth is not None:
+            try:
+                Stealth().apply_stealth_sync(context)
+            except Exception:
+                pass
+        # Stealth's spoofs are INCOHERENT on this Linux box (platform->Win32,
+        # languages->en-US, WebGL->Mac) which trips LinkedIn's lie-detector; correct
+        # them back to coherent Linux/en-GB values.
         try:
-            Stealth().apply_stealth_sync(context)
+            context.add_init_script(_COHERENCE_JS)
         except Exception:
             pass
-    # Stealth's spoofs are INCOHERENT on this Linux box (platform->Win32,
-    # languages->en-US, WebGL->Mac) which trips LinkedIn's lie-detector; correct
-    # them back to coherent Linux/en-GB values.
-    try:
-        context.add_init_script(_COHERENCE_JS)
+        page = context.new_page()
+        return page, context, browser, playwright
     except Exception:
-        pass
-    page = context.new_page()
-    return page, context, browser, playwright
+        try:
+            playwright.stop()
+        except Exception:
+            pass
+        raise
 
 
 def _save_cookies(session):

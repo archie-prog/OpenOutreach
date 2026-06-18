@@ -706,6 +706,7 @@ def api_campaign_add_leads(request, campaign_id):
 @staff_member_required
 def api_campaign_leads(request, campaign_id):
     from linkedin.models import LeadCampaignState
+    from linkedin.sequences.executor import MAX_STEP_ATTEMPTS
 
     states = (
         LeadCampaignState.objects.filter(campaign_id=campaign_id)
@@ -726,8 +727,12 @@ def api_campaign_leads(request, campaign_id):
             "ai_score": s.lead.ai_score,
             "stage": stage,
             "state": s.state,
+            # Surface why a lead stalled/parked (was invisible) — shown on the row
+            # for stopped_error leads, and as a warning while retries are pending.
+            "last_error": s.last_error,
+            "error_count": s.error_count,
         })
-    return JsonResponse({"leads": leads})
+    return JsonResponse({"leads": leads, "max_attempts": MAX_STEP_ATTEMPTS})
 
 
 @staff_member_required

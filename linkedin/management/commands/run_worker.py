@@ -37,8 +37,10 @@ class Command(BaseCommand):
 
         interval = options["interval"]
         HEAVY_EVERY = 600        # heavy enrichment/scoring cadence (seconds)
+        INBOX_EVERY = 300        # reply-poll / manual-send cadence (seconds)
         REAUTH_COOLDOWN = 1800   # don't re-attempt a failing account's login more than this often
         last_heavy = 0.0
+        last_inbox = 0.0
         consecutive_errors = 0
         acct_cooldown = {}       # profile pk -> monotonic time of last failed acquire
 
@@ -109,65 +111,82 @@ class Command(BaseCommand):
 
                 executed = 0
                 ran, skipped, asleep = [], [], []
-                sessions = {}
+                manual = stopped = 0
+                extra = ""
+                heavy_due = (time.monotonic() - last_heavy) >= HEAVY_EVERY
+                inbox_due = (time.monotonic() - last_inbox) >= INBOX_EVERY
                 now_m = time.monotonic()
+                # Serialize browsers: Playwright's sync API allows only ONE live
+                # instance per OS thread, and concurrent sessions from one IP are a
+                # detection signal — so open at most one account's browser at a time
+                # and CLOSE it before the next opens. The default account also runs
+                # inbox/manual + heavy enrichment inside its own open window.
                 for acct in accounts:
+                    is_default = bool(fallback and acct.pk == fallback.pk)
                     if acct.auto_paused_at is not None:
                         skipped.append(acct.linkedin_username + "(paused)")
                         continue
                     if not in_session(acct, now_dt):
                         # Outside working hours — close any open browser, do nothing.
-                        existing = get_or_create_session(acct)
-                        if existing.page is not None:
-                            existing.close_browser()
+                        get_or_create_session(acct).close_browser()
                         asleep.append(acct.linkedin_username)
                         continue
                     cooled = acct_cooldown.get(acct.pk)
                     if cooled is not None and (now_m - cooled) < REAUTH_COOLDOWN:
                         skipped.append(acct.linkedin_username)
                         continue
-                    try:
-                        session = acquire_session(acct)
-                    except AuthenticationError as exc:
-                        auto_pause(acct, "LinkedIn rejected the session (%s)" % exc)
-                        skipped.append(acct.linkedin_username + "(paused)")
+                    # Open only when there's work: a non-default account opens for its
+                    # due sequence steps; the default also opens for due inbox/heavy.
+                    has_send_work = bool(groups.get(acct.pk))
+                    default_work = is_default and (inbox_due or heavy_due)
+                    if not has_send_work and not default_work:
+                        get_or_create_session(acct).close_browser()
                         continue
-                    except Exception as exc:
-                        acct_cooldown[acct.pk] = now_m
-                        skipped.append(acct.linkedin_username)
-                        logger.warning("Account %s unavailable — skipping: %s", acct.linkedin_username, exc)
-                        continue
-                    acct_cooldown.pop(acct.pk, None)
-                    sessions[acct.pk] = session
+                    session = get_or_create_session(acct)
                     try:
-                        executed += run_states(session, groups.get(acct.pk, []))
-                        ran.append(acct.linkedin_username)
-                    except AuthenticationError as exc:
-                        auto_pause(acct, "LinkedIn 401 during sending (%s)" % exc)
-
-                # ── Inbox + manual sends on the default account (in-session only) ──
-                manual = stopped = 0
-                default_session = sessions.get(fallback.pk) if fallback else None
-                if default_session is not None:
-                    try:
-                        manual = process_pending_sends(default_session)
-                        stopped = poll_replies(default_session, limit=12)
-                    except AuthenticationError as exc:
-                        auto_pause(fallback, "LinkedIn 401 during reply-poll (%s)" % exc)
-                        default_session = None
-
-                # ── Heavy work, only when the default account is in-session ──────
-                extra = ""
-                now = time.monotonic()
-                if now - last_heavy >= HEAVY_EVERY and default_session is not None:
-                    try:
-                        searched = process_pending_searches(default_session, cap=30)
-                        backfilled = backfill_lead_profiles(default_session, limit=8)
-                        scored = score_pending_leads(limit=15)
-                        last_heavy = now
-                        extra = f" searches={searched} backfilled={backfilled} scored={scored}"
-                    except AuthenticationError as exc:
-                        auto_pause(fallback, "LinkedIn 401 during enrichment (%s)" % exc)
+                        try:
+                            acquire_session(acct)
+                        except AuthenticationError as exc:
+                            auto_pause(acct, "LinkedIn rejected the session (%s)" % exc)
+                            skipped.append(acct.linkedin_username + "(paused)")
+                            continue
+                        except Exception as exc:
+                            acct_cooldown[acct.pk] = now_m
+                            skipped.append(acct.linkedin_username)
+                            logger.warning("Account %s unavailable — skipping: %s", acct.linkedin_username, exc)
+                            continue
+                        acct_cooldown.pop(acct.pk, None)
+                        try:
+                            executed += run_states(session, groups.get(acct.pk, []))
+                            ran.append(acct.linkedin_username)
+                        except AuthenticationError as exc:
+                            auto_pause(acct, "LinkedIn 401 during sending (%s)" % exc)
+                        # If sending just auto-paused this account (401 / restriction
+                        # page), do NOT then run inbox/reply-poll/enrichment on the
+                        # same flagged session this cycle — that was the ~1,038x
+                        # reply-poll hammer. It's skipped from the next cycle anyway.
+                        if is_default and acct.auto_paused_at is None:
+                            paused_now = False
+                            if inbox_due:
+                                try:
+                                    manual = process_pending_sends(session)
+                                    stopped = poll_replies(session, limit=12)
+                                    last_inbox = time.monotonic()
+                                except AuthenticationError as exc:
+                                    auto_pause(acct, "LinkedIn 401 during reply-poll (%s)" % exc)
+                                    paused_now = True
+                            if heavy_due and not paused_now:
+                                try:
+                                    searched = process_pending_searches(session, cap=30)
+                                    backfilled = backfill_lead_profiles(session, limit=8)
+                                    scored = score_pending_leads(limit=15)
+                                    last_heavy = time.monotonic()
+                                    extra = f" searches={searched} backfilled={backfilled} scored={scored}"
+                                except AuthenticationError as exc:
+                                    auto_pause(acct, "LinkedIn 401 during enrichment (%s)" % exc)
+                    finally:
+                        # Close before the next account opens (strict serialize).
+                        session.close_browser()
 
                 consecutive_errors = 0
                 note = ""
