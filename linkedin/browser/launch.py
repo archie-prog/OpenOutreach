@@ -132,6 +132,11 @@ def _fresh_login(session):
     if lp.totp_secret:
         from linkedin.auth.login import login_with_totp
         login_with_totp(session, lp.linkedin_username, lp.linkedin_password, lp.totp_secret)
+    elif lp.password_login_ok:
+        # 2FA-off account: same fingerprinted, human-typed flow, no secret needed
+        # (completes when no challenge appears; fails gracefully if one does).
+        from linkedin.auth.login import login_with_totp
+        login_with_totp(session, lp.linkedin_username, lp.linkedin_password, "")
     else:
         authenticate(session, username=lp.linkedin_username, password=lp.linkedin_password)
     _save_cookies(session)

@@ -279,6 +279,68 @@ def poll_replies(session, campaign=None, limit=None) -> int:
     return stopped
 
 
+def sync_inbox(session, limit=None) -> int:
+    """Refresh THIS account's KIT-CONTACTED threads from the live inbox — reliably.
+
+    For each ``contacted_by_tool`` thread we re-fetch the conversation via
+    ``fetch_thread_messages`` (the proven per-lead path poll_replies uses:
+    ``get_conversation`` with a profile-navigation fallback). That fallback finds a
+    reply even when the stored conversation URN is stale or the thread is outside
+    the recent inbox window — the gap that left replies (e.g. Alice's) unsynced.
+    Only kit-contacted threads (never organic / HeyReach), per-account, on demand.
+    Returns the number of threads that gained new messages.
+    """
+    from linkedin.models import Message, MessageThread
+
+    account = session.linkedin_profile
+    threads = list(
+        MessageThread.objects.filter(account=account, contacted_by_tool=True).select_related("lead")
+    )
+    if limit:
+        threads = threads[:limit]
+
+    updated = 0
+    for thread in threads:
+        if not thread.lead_id:
+            continue
+        # Proven per-lead fetch (same path as poll_replies): get_conversation with
+        # a profile-navigation fallback, so a reply is found even when the stored
+        # conversation URN is stale or the thread is outside the recent inbox window.
+        try:
+            messages = fetch_thread_messages(session, thread.lead)
+        except Exception:
+            logger.exception("sync_inbox: fetch failed for thread %s", thread.pk)
+            continue
+
+        latest = thread.last_message_at
+        gained = False
+        for m in messages:
+            _obj, created = Message.objects.get_or_create(
+                thread=thread,
+                linkedin_message_id=m["linkedin_message_id"],
+                defaults={
+                    "direction": m["direction"],
+                    "body": m["body"],
+                    "sent_at": m["sent_at"],
+                    "sender_account": account if m["direction"] == "out" else None,
+                },
+            )
+            if created:
+                gained = True
+            if m["sent_at"] and (latest is None or m["sent_at"] > latest):
+                latest = m["sent_at"]
+            if m["direction"] == "in":
+                thread.has_inbound_reply = True
+
+        thread.last_message_at = latest
+        thread.last_polled_at = timezone.now()
+        thread.save()
+        if gained:
+            updated += 1
+
+    return updated
+
+
 def _notify_reply(lead, body, session):
     """Fire a Slack reply notification (never raises into the poll loop)."""
     try:

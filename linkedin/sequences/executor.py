@@ -264,41 +264,79 @@ def run_due_states(session, campaign=None, limit=None) -> int:
 
 
 
-def _account_for_state(state, fallback_profile, pool_cache):
-    """The account that should run *state*: its sticky assignment if already set,
-    otherwise one picked from the campaign's sending_accounts pool (deterministic
-    by lead id so a given pool always maps a lead to the same account) and then
-    persisted. Falls back to *fallback_profile* (NOT persisted) when the pool is
-    empty, so adding a pool later still lets unassigned leads distribute."""
-    if state.sending_account_id:
-        return state.sending_account
-    cid = state.campaign_id
-    if cid not in pool_cache:
-        pool_cache[cid] = sorted(state.campaign.sending_accounts.all(), key=lambda pr: pr.pk)
-    pool = pool_cache[cid]
-    if not pool:
-        return fallback_profile
-    chosen = pool[state.lead_id % len(pool)]
-    LeadCampaignState.objects.filter(pk=state.pk).update(sending_account=chosen)
-    state.sending_account = chosen
-    return chosen
+def _account_for_state(state):
+    """The STICKY owner of an already-claimed lead, or None while it is still
+    pre-connect (unowned). Ownership is appointed only when the connect request is
+    actually sent (``_handle_connect``) and never changes afterwards — a lead's
+    whole sequence stays on the one identity that made its connection (anti-ban
+    Rule #6: a mid-sequence identity switch is a cross-account correlation signal)."""
+    return state.sending_account if state.sending_account_id else None
 
 
 def due_states_by_account(fallback_profile):
-    """Group every due state by the account assigned to run it. Each lead gets a
-    sticky account from its campaign's ``sending_accounts`` pool (or
-    *fallback_profile* when the pool is empty), assigned on first run and kept for
-    the whole sequence. Returns ``(profile, [states])`` in ai-score order within
-    each account so capped actions still favor the best leads."""
+    """Group every due state by the account that will run it.
+
+    Owned states stay STICKY to their ``sending_account``. Unowned (pre-connect)
+    states are a SHARED POOL: each is handed to a campaign account that is active,
+    not auto-paused, in its send window and still has connect headroom — taking the
+    one with the most remaining cap this cycle (ties → least-recently-used), so
+    volume spreads evenly across accounts and maxes each one's configured cap. The
+    choice is NOT persisted here (the owner is recorded only on send), so an unsent
+    lead re-routes to whoever has room next cycle. Timing is untouched:
+    ``advance_state``'s ``has_capacity``/``next_action_at`` gate still drips each
+    account's connects randomly across ITS own working-day window. Returns
+    ``(profile, [states])`` in ai-score order within each account."""
+    from django.utils import timezone
+
+    from linkedin.accounts.limits import cap_for, daily_count, has_capacity, in_session
+
+    now = timezone.now()
     groups = {}      # pk -> [profile, [states]]
-    pool_cache = {}  # campaign_id -> [profiles]
+    pool_cache = {}  # campaign_id -> [eligible profiles, LRU-sorted]
+    cap = {}         # profile pk -> its OWN connect cap today
+    sent = {}        # profile pk -> connects it has already sent today
+    given = {}       # profile pk -> leads handed to it THIS cycle (round-robin counter)
+
+    def _eligible(campaign):
+        if campaign.id not in pool_cache:
+            elig = []
+            for pr in campaign.sending_accounts.all():
+                if not pr.active or pr.auto_paused_at is not None:
+                    continue
+                if not in_session(pr, now) or not has_capacity(pr, "connect"):
+                    continue
+                cap[pr.pk] = cap_for(pr, "connect")
+                sent[pr.pk] = daily_count(pr, "connect")
+                given[pr.pk] = 0
+                elig.append(pr)
+            # never-used first, then oldest last_used_at — LRU round-robin.
+            elig.sort(key=lambda a: (a.last_used_at is not None, a.last_used_at or now))
+            pool_cache[campaign.id] = elig
+        return pool_cache[campaign.id]
+
+    def _add(acct, st):
+        groups.setdefault(acct.pk, [acct, []])[1].append(st)
+
     for st in due_states():
-        acct = _account_for_state(st, fallback_profile, pool_cache)
-        if acct is None:
+        owner = _account_for_state(st)
+        if owner is not None:                       # already-connected → sticky
+            _add(owner, st)
             continue
-        if acct.pk not in groups:
-            groups[acct.pk] = [acct, []]
-        groups[acct.pk][1].append(st)
+        pool = _eligible(st.campaign)
+        if not pool:
+            if fallback_profile is not None and fallback_profile.auto_paused_at is None:
+                _add(fallback_profile, st)          # pool-less campaign → default account
+            continue
+        # Each account operates INDEPENDENTLY: bounded only by ITS OWN daily cap, with
+        # leads dealt round-robin (fewest handed out THIS cycle, ties → least-recently-
+        # used) — an account's share never depends on how much the OTHERS have sent. Its
+        # own randomised cap + next_action_at pacing govern its rate across its own window.
+        free = [a for a in pool if sent[a.pk] + given[a.pk] < cap[a.pk]]
+        if not free:
+            continue                                # every eligible account at its own cap
+        chosen = min(free, key=lambda a: given[a.pk])
+        given[chosen.pk] += 1
+        _add(chosen, st)
     return [(prof, states) for prof, states in groups.values()]
 
 
@@ -418,10 +456,14 @@ def _handle_connect(session, state, step):
         # retry and fire a SECOND invite. A lost _log only under-counts the connect
         # (acceptable); a double-invite is the cardinal sin this system avoids.
         wait_days = int(step.config.get("wait_days_before_branch_decision", DEFAULT_CONNECT_DECISION_DAYS))
+        # Appoint the owner at the instant the request is sent: pre-connect leads
+        # are an unowned shared pool, but from here the lead is STICKY to this
+        # identity for the rest of its sequence (anti-ban Rule #6).
+        state.sending_account = session.linkedin_profile
         state.awaiting_decision = True
         state.last_action_at = timezone.now()
         state.next_action_due_at = timezone.now() + timedelta(days=wait_days)
-        state.save(update_fields=["awaiting_decision", "last_action_at", "next_action_due_at"])
+        state.save(update_fields=["sending_account", "awaiting_decision", "last_action_at", "next_action_due_at"])
         _log(session, state, step, ActionLog.ActionType.CONNECT)
         return
     # Decision phase: accepted → success branch, else → failure branch.
@@ -690,13 +732,16 @@ def render_template(template: str, context: dict, fallback: str = "") -> str:
     return rendered or fallback
 
 
-def _lead_context(state) -> dict:
+def _lead_context(state, profile=None) -> dict:
     lead = state.lead
     return {
         "first_name": lead.first_name or "",
         "last_name": lead.last_name or "",
         "company": lead.company or "",
         "public_identifier": lead.public_identifier,
+        # {sender_first_name} = the sending account's customisable sign-off name.
+        "sender_first_name": (getattr(profile, "signoff_name", "") or ""),
+        "sender_name": (getattr(profile, "signoff_name", "") or ""),  # alias for {sender_first_name}
     }
 
 
@@ -722,7 +767,7 @@ def send_connection_request(session, state, step):
     # If the step carries a personalised note, send WITH it via the app-side flow
     # (linkedin_cli's connect verb is note-less). Render placeholders first; fall
     # back to the note-less verb if the note is empty or the with-note flow fails.
-    note = render_template(step.config.get("personalised_note", ""), _lead_context(state), "")
+    note = render_template(step.config.get("personalised_note", ""), _lead_context(state, session.linkedin_profile), "")
     if note:
         from linkedin.actions.connect_note import send_connection_request_with_note
 
@@ -764,7 +809,7 @@ def send_message(session, state, step):
     lead = state.lead
     body = render_template(
         step.config.get("template", ""),
-        _lead_context(state),
+        _lead_context(state, session.linkedin_profile),
         step.config.get("fallback", ""),
     )
     urn = lead.urn or lead.get_urn(session)
@@ -775,7 +820,7 @@ def send_message(session, state, step):
 def send_inmail(session, state, step):
     from linkedin.actions.inmail import send_inmail as _send
 
-    ctx = _lead_context(state)
+    ctx = _lead_context(state, session.linkedin_profile)
     subject = render_template(step.config.get("subject", ""), ctx, step.config.get("subject_fallback", ""))
     body = render_template(step.config.get("body", ""), ctx, step.config.get("body_fallback", ""))
     return _send(session, state.lead, subject, body)

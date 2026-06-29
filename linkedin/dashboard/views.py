@@ -416,6 +416,7 @@ def api_accounts(request):
         out.append({
             "id": a.pk, "username": a.linkedin_username, "active": a.active,
             "has_inmail": a.has_inmail, "has_totp": bool(a.totp_secret),
+            "signoff_name": a.signoff_name, "password_login_ok": a.password_login_ok,
             "inmail_monthly_cap": a.inmail_monthly_cap, "inmail_used_month": inmail_sent_this_month(a),
             "connect_cap": caps.get("connect", 25), "message_cap": caps.get("message", 50),
             "connect_used": daily_count(a, "connect"), "message_used": daily_count(a, "message"),
@@ -508,6 +509,10 @@ def api_account_update(request, account_id):
     # corrected — the old `if payload.get(...)` made the secret write-once.
     if "totp_secret" in payload:
         prof.totp_secret = (payload.get("totp_secret") or "").replace(" ", "").upper()
+    if "signoff_name" in payload:
+        prof.signoff_name = str(payload.get("signoff_name") or "")[:100]
+    if "password_login_ok" in payload:
+        prof.password_login_ok = bool(payload["password_login_ok"])
     # Allow rotating the LinkedIn email/password from the dashboard. Changing
     # either invalidates the saved cookie session, so drop it to force a fresh
     # (TOTP-aware) login on the next worker cycle.
@@ -824,8 +829,8 @@ def api_inbox_threads(request):
     # Conversations with at least one MESSAGE (excludes connection-request-only
     # threads). filter: all | replied (has inbound) | sent (outbound, no reply yet).
     f = request.GET.get("filter", "replied")
-    # Only threads THIS tool actually started — never the account's pre-existing
-    # LinkedIn conversations from other tools.
+    # Only threads THIS kit actually contacted — never the account's organic /
+    # other-tool (e.g. HeyReach) conversations.
     base = MessageThread.objects.filter(contacted_by_tool=True, messages__isnull=False)
     # Archived threads are hidden everywhere except the dedicated "archived" view.
     if f == "archived":
@@ -864,6 +869,20 @@ def api_inbox_threads(request):
             "archived": t.archived_at is not None,
         })
     return JsonResponse({"threads": threads})
+
+
+@staff_member_required
+@require_POST
+def api_inbox_sync(request):
+    """Drop the flag the worker watches → it runs a full inbox sync next cycle
+    (the Unibox 'Sync' button). No constant background polling."""
+    from pathlib import Path
+
+    try:
+        Path("/app/data/.inbox_sync").touch()
+    except Exception:
+        return JsonResponse({"queued": False})
+    return JsonResponse({"queued": True})
 
 
 @staff_member_required

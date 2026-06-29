@@ -222,6 +222,10 @@ class LinkedInProfile(models.Model):
         on_delete=models.SET_NULL,
         related_name="+",
     )
+    # Name this account signs outreach off with — the {sender_name} template tag.
+    signoff_name = models.CharField(max_length=100, blank=True, default="")
+    # 2FA disabled on this account → kit may log in headlessly with the password.
+    password_login_ok = models.BooleanField(default=False)
     linkedin_username = models.CharField(max_length=200)
     linkedin_password = models.CharField(max_length=200)
     subscribe_newsletter = models.BooleanField(default=True)

@@ -66,6 +66,53 @@ def _settle(page, timeout_ms: int = _NAV_TIMEOUT_MS) -> None:
             pass
 
 
+def _login_field(page, *selectors):
+    """First visible input matching any selector — LinkedIn serves a legacy
+    (#username) and a newer React login form (dynamic ids); match by type/autocomplete."""
+    loc = page.locator(", ".join(selectors))
+    for i in range(loc.count()):
+        el = loc.nth(i)
+        try:
+            if el.is_visible():
+                return el
+        except Exception:
+            continue
+    return loc.first
+
+
+def _click_signin(page):
+    """Click the visible 'Sign in' submit (exact drops 'Sign in with Apple';
+    the React form renders duplicate hidden copies)."""
+    btn = page.get_by_role("button", name="Sign in", exact=True)
+    for i in range(btn.count()):
+        b = btn.nth(i)
+        try:
+            if b.is_visible():
+                b.click()
+                return
+        except Exception:
+            continue
+    btn.first.click()
+
+
+def _enter(field, text):
+    """Human-type into a login field, then ensure the value landed — LinkedIn's
+    React form can drop slow keystrokes on re-render, so fall back to fill()."""
+    from linkedin_cli.browser.nav import human_type
+    try:
+        human_type(field, text)
+    except Exception:
+        pass
+    try:
+        if (field.input_value() or "") != text:
+            field.fill(text)
+    except Exception:
+        try:
+            field.fill(text)
+        except Exception:
+            pass
+
+
 def login_with_totp(session, username: str, password: str, totp_secret: str) -> None:
     """Drive the LinkedIn login form and auto-clear a TOTP 2FA challenge.
 
@@ -76,10 +123,16 @@ def login_with_totp(session, username: str, password: str, totp_secret: str) -> 
     page = session.page
 
     page.goto(LOGIN_URL, wait_until="domcontentloaded")
-    from linkedin_cli.browser.nav import human_type
-    human_type(page.locator("#username"), username)
-    human_type(page.locator("#password"), password)
-    page.get_by_role("button", name="Sign in").click()
+    # Let the React login form hydrate before filling — slow keystrokes into a
+    # not-yet-interactive form get dropped, and a duplicate hidden form mis-targets.
+    try:
+        page.wait_for_selector("input[autocomplete='username'], #username", state="visible", timeout=15000)
+    except Exception:
+        pass
+    page.wait_for_timeout(1500)
+    _enter(_login_field(page, "#username", "input[autocomplete='username']", "input[type='email']"), username)
+    _enter(_login_field(page, "#password", "input[autocomplete='current-password']", "input[type='password']"), password)
+    _click_signin(page)
     # CRITICAL: wait for the post-submit navigation before reading the URL,
     # otherwise we still see the login page and miss the challenge entirely.
     _settle(page)

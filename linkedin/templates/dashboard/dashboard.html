@@ -150,6 +150,7 @@
       <div class="filterbar">
         <span><label>Period</label><select id="dashdays">
           <option value="0">All time</option>
+          <option value="1">Last 24 hours</option>
           <option value="7">Last 7 days</option>
           <option value="30" selected>Last 30 days</option>
           <option value="90">Last 90 days</option>
@@ -192,7 +193,7 @@
     </div>
 
     <div class="tab" id="tab-unibox">
-      <div class="bar"><b>Unibox</b> &nbsp; <label>Account:</label> <select id="inboxacct"><option value="">All accounts</option></select> &nbsp; <label>Campaign:</label> <select id="inboxcamp"><option value="">All campaigns</option></select> &nbsp; <label>Lead list:</label> <select id="inboxlist"><option value="">All lists</option></select> &nbsp; <label>Show:</label> <select id="inboxfilter"><option value="replied">Replied</option><option value="sent">Sent (no reply yet)</option><option value="all">All conversations</option><option value="archived">Archived</option></select></div>
+      <div class="bar"><b>Unibox</b> &nbsp; <label>Account:</label> <select id="inboxacct"><option value="">All accounts</option></select> &nbsp; <label>Campaign:</label> <select id="inboxcamp"><option value="">All campaigns</option></select> &nbsp; <label>Lead list:</label> <select id="inboxlist"><option value="">All lists</option></select> &nbsp; <label>Show:</label> <select id="inboxfilter"><option value="replied">Replied</option><option value="sent">Sent (no reply yet)</option><option value="all">All conversations</option><option value="archived">Archived</option></select> &nbsp; <button id="inboxsync" onclick="syncInbox()">⟳ Sync</button> <span id="inboxsyncmsg" class="hint" style="margin-left:8px"></span></div>
       <div class="inbox">
         <div class="threadlist" id="threadlist"></div>
         <div class="convo" id="convo"><div class="hint" style="padding:24px">Select a conversation…</div></div>
@@ -533,6 +534,11 @@
               ${a.has_totp?`<button onclick="clearTotp(${a.id})">Clear 2FA</button>`:""}
               &nbsp;&nbsp;Rotate login: <input id="ac_email_${a.id}" placeholder="new email (blank = keep)" style="width:170px">
               <input id="ac_pw_${a.id}" type="password" placeholder="new password" style="width:140px" autocomplete="new-password">
+              &nbsp;&nbsp;<label style="display:inline" title="Account has no 2FA — let the kit log in with just the password (auto-relogin)"><input type="checkbox" id="ac_pwlogin_${a.id}" ${a.password_login_ok?"checked":""}> no-2FA auto-login</label>
+            </div>
+            <div style="margin-top:8px;font-size:12px">
+              <b>Sign-off</b> &nbsp;<input id="ac_signoff_${a.id}" value="${a.signoff_name||''}" placeholder="name for {sender_first_name}" style="width:170px">
+              <span class="hint">name this account signs messages with</span>
             </div>
           </td></tr>`;
         }).join("") || `<tr><td colspan="8">No accounts.</td></tr>`;
@@ -604,6 +610,8 @@
       // Only send security fields when the user actually typed something —
       // sending an empty totp_secret would CLEAR it, an empty password is a no-op.
       const totp = gv("ac_totp_"+id), email = gv("ac_email_"+id), pw = gv("ac_pw_"+id);
+      body.signoff_name = gv("ac_signoff_"+id);
+      body.password_login_ok = document.getElementById("ac_pwlogin_"+id).checked;
       if (totp) body.totp_secret = totp;
       if (email) body.linkedin_username = email;
       if (pw) body.linkedin_password = pw;
@@ -928,6 +936,16 @@
           </div>`).join("");
       });
     }
+    window.syncInbox = () => {
+      const b = document.getElementById("inboxsync"), m = document.getElementById("inboxsyncmsg");
+      b.disabled = true; m.textContent = "Syncing…";
+      j("api/inbox/sync/", {method:"POST", headers:{"Content-Type":"application/json"}}).then(r => {
+        m.textContent = (r && r.queued) ? "Sync queued — messages refresh within ~2 min" : "Sync failed";
+        b.disabled = false;
+        setTimeout(loadThreads, 30000);
+        setTimeout(() => { loadThreads(); m.textContent = ""; }, 90000);
+      }).catch(() => { m.textContent = "Sync failed"; b.disabled = false; });
+    };
     window.openThread = (id) => {
       CUR_THREAD = id;
       j(`api/inbox/thread/${id}/`).then(t => {

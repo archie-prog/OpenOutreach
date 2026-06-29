@@ -18,10 +18,12 @@ class Command(BaseCommand):
 
         from linkedin.accounts.limits import in_session
         from linkedin.browser.registry import get_first_active_profile, get_or_create_session
-        from linkedin.inbox.poller import poll_replies, process_pending_sends
+        from pathlib import Path
+
+        from linkedin.inbox.poller import poll_replies, process_pending_sends, sync_inbox
         from linkedin.leads.importer import backfill_lead_profiles, process_pending_searches
         from linkedin.ml.lead_score import score_pending_leads
-        from linkedin.models import LinkedInProfile
+        from linkedin.models import LeadList, LinkedInProfile
         from linkedin.notify.slack import post_text
         from linkedin.sequences.executor import (
             active_sending_accounts,
@@ -36,6 +38,10 @@ class Command(BaseCommand):
                 pass
 
         interval = options["interval"]
+        # Manual inbox sync: the Unibox drops this flag file (shared data volume);
+        # the worker runs sync_inbox when it's present, then clears it — so LinkedIn
+        # is read for messages only when you ask, never on a constant timer.
+        INBOX_FLAG = Path("/app/data/.inbox_sync")
         HEAVY_EVERY = 600        # heavy enrichment/scoring cadence (seconds)
         INBOX_EVERY = 300        # reply-poll / manual-send cadence (seconds)
         REAUTH_COOLDOWN = 1800   # don't re-attempt a failing account's login more than this often
@@ -49,7 +55,7 @@ class Command(BaseCommand):
             "time in the first 30 min of its window and closes near the end; nothing runs overnight)"))
 
         def acquire_session(acct):
-            if not acct.cookie_data and not acct.totp_secret:
+            if not acct.cookie_data and not acct.totp_secret and not acct.password_login_ok:
                 raise RuntimeError("no saved session and no TOTP secret — needs a one-time manual login")
             session = get_or_create_session(acct)
             session.ensure_browser()
@@ -116,11 +122,39 @@ class Command(BaseCommand):
                 heavy_due = (time.monotonic() - last_heavy) >= HEAVY_EVERY
                 inbox_due = (time.monotonic() - last_inbox) >= INBOX_EVERY
                 now_m = time.monotonic()
+
+                # ── Pending searches (user-initiated manual research) ─────────
+                # A queued people-search is the user's own action and read-only
+                # (scrape + profile views, never an invite), so it runs ANY time/
+                # day — NOT gated by the send window. Uses the default account's
+                # one serialized browser, opened and closed here before the send
+                # loop touches any browser (no concurrent sessions).
+                if (fallback is not None
+                        and LeadList.objects.filter(pending_search=True, archived_at__isnull=True).exists()):
+                    s_cool = acct_cooldown.get(fallback.pk)
+                    if (fallback.auto_paused_at is None
+                            and (fallback.cookie_data or fallback.totp_secret)
+                            and not (s_cool is not None and (now_m - s_cool) < REAUTH_COOLDOWN)):
+                        s_session = get_or_create_session(fallback)
+                        try:
+                            acquire_session(fallback)
+                            searched = process_pending_searches(s_session, cap=30)
+                            if searched:
+                                extra += f" searches={searched}"
+                        except AuthenticationError as exc:
+                            auto_pause(fallback, "LinkedIn rejected the session during search (%s)" % exc)
+                        except Exception as exc:
+                            acct_cooldown[fallback.pk] = now_m
+                            logger.warning("On-demand search skipped: %s", exc)
+                        finally:
+                            s_session.close_browser()
+
                 # Serialize browsers: Playwright's sync API allows only ONE live
                 # instance per OS thread, and concurrent sessions from one IP are a
                 # detection signal — so open at most one account's browser at a time
                 # and CLOSE it before the next opens. The default account also runs
                 # inbox/manual + heavy enrichment inside its own open window.
+                sync_requested = INBOX_FLAG.exists()
                 for acct in accounts:
                     is_default = bool(fallback and acct.pk == fallback.pk)
                     if acct.auto_paused_at is not None:
@@ -139,7 +173,7 @@ class Command(BaseCommand):
                     # due sequence steps; the default also opens for due inbox/heavy.
                     has_send_work = bool(groups.get(acct.pk))
                     default_work = is_default and (inbox_due or heavy_due)
-                    if not has_send_work and not default_work:
+                    if not has_send_work and not default_work and not sync_requested:
                         get_or_create_session(acct).close_browser()
                         continue
                     session = get_or_create_session(acct)
@@ -177,17 +211,35 @@ class Command(BaseCommand):
                                     paused_now = True
                             if heavy_due and not paused_now:
                                 try:
-                                    searched = process_pending_searches(session, cap=30)
                                     backfilled = backfill_lead_profiles(session, limit=8)
                                     scored = score_pending_leads(limit=15)
                                     last_heavy = time.monotonic()
-                                    extra = f" searches={searched} backfilled={backfilled} scored={scored}"
+                                    extra += f" backfilled={backfilled} scored={scored}"
                                 except AuthenticationError as exc:
                                     auto_pause(acct, "LinkedIn 401 during enrichment (%s)" % exc)
+                        # Reply-poll SAFETY for NON-default accounts (the default polls
+                        # in its own block above). Without this, a reply on another
+                        # account never flips the lead to stopped_reply, so it keeps
+                        # getting follow-ups — the exact "if they replied, stop" rule.
+                        if inbox_due and not is_default and acct.auto_paused_at is None:
+                            try:
+                                poll_replies(session, limit=12)
+                            except AuthenticationError as exc:
+                                auto_pause(acct, "LinkedIn 401 during reply-poll (%s)" % exc)
+                        # On-demand inbox sync for THIS account (Unibox 'Sync') — runs
+                        # for EVERY account so non-default ones (e.g. Toby's) sync too.
+                        if sync_requested and acct.auto_paused_at is None:
+                            try:
+                                synced = sync_inbox(session)
+                                extra += f" synced[{acct.linkedin_username}]={synced}"
+                            except AuthenticationError as exc:
+                                auto_pause(acct, "LinkedIn 401 during inbox sync (%s)" % exc)
                     finally:
                         # Close before the next account opens (strict serialize).
                         session.close_browser()
 
+                if sync_requested:
+                    INBOX_FLAG.unlink(missing_ok=True)
                 consecutive_errors = 0
                 note = ""
                 if ran:

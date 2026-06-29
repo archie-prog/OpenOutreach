@@ -45,6 +45,7 @@ urlpatterns = [
     path("api/campaign/<int:campaign_id>/detail/", views.api_campaign_detail, name="dashboard_api_campaign_detail"),
     path("api/inbox/accounts/", views.api_inbox_accounts, name="dashboard_api_inbox_accounts"),
     path("api/inbox/threads/", views.api_inbox_threads, name="dashboard_api_inbox_threads"),
+    path("api/inbox/sync/", views.api_inbox_sync, name="dashboard_api_inbox_sync"),
     path("api/inbox/thread/<int:thread_id>/", views.api_inbox_thread, name="dashboard_api_inbox_thread"),
     path("api/inbox/thread/<int:thread_id>/archive/", views.api_inbox_archive, name="dashboard_api_inbox_archive"),
     path("api/settings/", views.api_settings, name="dashboard_api_settings"),
