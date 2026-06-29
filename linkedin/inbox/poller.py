@@ -143,21 +143,46 @@ def _lead_campaign(lead):
     return state.campaign if state else None
 
 
-def has_new_reply(session, state) -> bool:
-    """Live check: has this lead sent us an inbound message since our last action?
+class ReplyCheckUnverified(Exception):
+    """The send-time reply check could not confirm the lead hasn't replied, so the
+    caller must NOT send. Raised (instead of failing open) so the executor defers +
+    retries the step; a warning is surfaced so a held follow-up is never silent."""
 
-    Used as a send-time guard so a reply that lands *during a Wait* stops the next
-    message — the background ``poll_replies`` rotates through leads and may not have
-    scanned this one yet, so relying on it alone leaves a race where we'd message
-    someone who already replied. Best-effort: a fetch failure returns False (we
-    proceed) rather than blocking the sequence."""
+
+def _safety_hold_warning(state, reason):
+    """A follow-up is being HELD because we couldn't verify no-reply — log it and
+    fire a Slack warning so it's visible, never silently stuck."""
+    lead = state.lead
+    name = ((getattr(lead, "first_name", "") or "") + " " + (getattr(lead, "last_name", "") or "")).strip() or f"lead {state.lead_id}"
+    logger.warning("SAFETY HOLD: not messaging %s (lead %s) — %s", name, state.lead_id, reason)
+    try:
+        from linkedin.notify.slack import post_text
+        post_text(f":warning: Follow-up HELD for *{name}* — couldn't confirm they haven't replied ({reason}). Holding + retrying; check the conversation.")
+    except Exception:
+        pass
+
+
+def has_new_reply(session, state) -> bool:
+    """Live send-time guard: True if the lead replied since our last action.
+
+    FAIL-CLOSED (the "only send if we know FOR SURE they haven't replied" rule):
+    if we cannot actually read the conversation — a fetch error, or an empty result
+    for a lead we've already messaged (missing/stale URN) — we do NOT know they
+    haven't replied, so we raise ``ReplyCheckUnverified`` to make the caller hold +
+    retry rather than risk messaging someone who already replied (and surface a
+    warning). A clean read with only outbound messages returns False (safe)."""
     if not state.last_action_at:
         return False
     try:
         messages = fetch_thread_messages(session, state.lead)
-    except Exception:
-        logger.warning("reply pre-check fetch failed for lead %s — proceeding", state.lead_id)
-        return False
+    except Exception as exc:
+        _safety_hold_warning(state, f"reply-check fetch error: {exc!r}")
+        raise ReplyCheckUnverified(state.lead_id) from exc
+    if not messages:
+        # We've already messaged this lead, so the conversation must contain our
+        # outbound. An empty result means we couldn't read it — hold, don't send.
+        _safety_hold_warning(state, "reply-check returned no messages for a contacted lead")
+        raise ReplyCheckUnverified(state.lead_id)
     for m in messages:
         if m["direction"] == "in" and m["sent_at"] and m["sent_at"] > state.last_action_at:
             return True
@@ -279,57 +304,84 @@ def poll_replies(session, campaign=None, limit=None) -> int:
     return stopped
 
 
-def sync_inbox(session, limit=None) -> int:
-    """Refresh THIS account's KIT-CONTACTED threads from the live inbox — reliably.
+def sync_inbox(session, limit=40) -> int:
+    """Refresh THIS account's KIT-CONTACTED threads — smallest detection surface.
 
-    For each ``contacted_by_tool`` thread we re-fetch the conversation via
-    ``fetch_thread_messages`` (the proven per-lead path poll_replies uses:
-    ``get_conversation`` with a profile-navigation fallback). That fallback finds a
-    reply even when the stored conversation URN is stale or the thread is outside
-    the recent inbox window — the gap that left replies (e.g. Alice's) unsynced.
-    Only kit-contacted threads (never organic / HeyReach), per-account, on demand.
-    Returns the number of threads that gained new messages.
+    ONE ``fetch_conversations`` lists the recent inbox (a reply bumps a conversation
+    to the top, so a new reply is always in this list); we then ``fetch_messages``
+    ONLY for recent conversations that match a thread THIS kit contacted. It never
+    touches organic / other-tool (HeyReach) conversations and makes no per-thread
+    call it doesn't need — 1 list call + a few message reads per account. Returns
+    the number of threads that gained new messages.
     """
+    from crm.models import Lead
     from linkedin.models import Message, MessageThread
+    from linkedin_cli.actions.conversations import parse_messages
+    from linkedin_cli.api.client import PlaywrightLinkedinAPI
+    from linkedin_cli.api.messaging import fetch_conversations, fetch_messages
 
-    account = session.linkedin_profile
-    threads = list(
-        MessageThread.objects.filter(account=account, contacted_by_tool=True).select_related("lead")
+    mailbox_urn = (session.self_profile or {}).get("urn")
+    if not mailbox_urn:
+        logger.warning("sync_inbox: no mailbox urn on session; skipping")
+        return 0
+
+    session.ensure_browser()
+    api = PlaywrightLinkedinAPI(session=session)
+    raw = fetch_conversations(api, mailbox_urn) or {}
+    elements = (
+        raw.get("data", {})
+        .get("messengerConversationsBySyncToken", {})
+        .get("elements", [])
     )
-    if limit:
-        threads = threads[:limit]
-
+    me = _self_name(session)
+    account = session.linkedin_profile
     updated = 0
-    for thread in threads:
-        if not thread.lead_id:
+
+    for conv in elements[:limit]:
+        conv_urn = conv.get("entityUrn")
+        if not conv_urn:
             continue
-        # Proven per-lead fetch (same path as poll_replies): get_conversation with
-        # a profile-navigation fallback, so a reply is found even when the stored
-        # conversation URN is stale or the thread is outside the recent inbox window.
-        try:
-            messages = fetch_thread_messages(session, thread.lead)
-        except Exception:
-            logger.exception("sync_inbox: fetch failed for thread %s", thread.pk)
+        part_urn = ""
+        for p in conv.get("conversationParticipants", []):
+            u = p.get("hostIdentityUrn", "")
+            if u and u != mailbox_urn:
+                part_urn = u
+                break
+        if not part_urn:
             continue
+        lead = Lead.objects.filter(urn=part_urn).first()
+        if not lead:
+            continue
+        # ONLY threads THIS kit contacted — never organic / HeyReach.
+        thread = MessageThread.objects.filter(
+            account=account, lead=lead, contacted_by_tool=True,
+        ).first()
+        if not thread:
+            continue
+        if not thread.linkedin_thread_id:
+            thread.linkedin_thread_id = conv_urn
 
         latest = thread.last_message_at
         gained = False
-        for m in messages:
+        for m in parse_messages(fetch_messages(api, conv_urn) or {}):
+            sender = m.get("sender", "")
+            ts = _parse_ts(m.get("timestamp", ""))
+            direction = "out" if sender == me else "in"
             _obj, created = Message.objects.get_or_create(
                 thread=thread,
-                linkedin_message_id=m["linkedin_message_id"],
+                linkedin_message_id=_synth_id(sender, m.get("text", ""), m.get("timestamp", "")),
                 defaults={
-                    "direction": m["direction"],
-                    "body": m["body"],
-                    "sent_at": m["sent_at"],
-                    "sender_account": account if m["direction"] == "out" else None,
+                    "direction": direction,
+                    "body": m.get("text", ""),
+                    "sent_at": ts,
+                    "sender_account": account if direction == "out" else None,
                 },
             )
             if created:
                 gained = True
-            if m["sent_at"] and (latest is None or m["sent_at"] > latest):
-                latest = m["sent_at"]
-            if m["direction"] == "in":
+            if ts and (latest is None or ts > latest):
+                latest = ts
+            if direction == "in":
                 thread.has_inbound_reply = True
 
         thread.last_message_at = latest

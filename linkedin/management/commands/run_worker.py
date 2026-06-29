@@ -1,6 +1,8 @@
 import logging
+import random
 import time
 import traceback
+from datetime import timedelta
 
 from django.core.management.base import BaseCommand
 
@@ -47,6 +49,14 @@ class Command(BaseCommand):
         REAUTH_COOLDOWN = 1800   # don't re-attempt a failing account's login more than this often
         last_heavy = 0.0
         last_inbox = 0.0
+        # Full inbox sync runs ~3x/day at jittered human-hour slots (morning, lunch,
+        # late afternoon) so replies are caught without constant polling. The exact
+        # times vary every day (never a fixed pattern). Runs regardless of the send
+        # window — reading the inbox isn't sending.
+        SYNC_SLOTS = ((9, 11), (12, 14), (16, 17))
+        sync_day = None
+        sync_targets = []
+        slots_done = set()
         consecutive_errors = 0
         acct_cooldown = {}       # profile pk -> monotonic time of last failed acquire
 
@@ -83,6 +93,16 @@ class Command(BaseCommand):
             connection.close()
             try:
                 now_dt = timezone.now()
+                if now_dt.date() != sync_day:
+                    sync_day = now_dt.date()
+                    slots_done = set()
+                    sync_targets = [
+                        now_dt.replace(hour=h0, minute=0, second=0, microsecond=0)
+                        + timedelta(minutes=random.randint(0, (h1 - h0) * 60 - 1))
+                        for (h0, h1) in SYNC_SLOTS
+                    ]
+                full_sync_due = any(now_dt >= t and i not in slots_done
+                                    for i, t in enumerate(sync_targets))
 
                 # ── Connection tests (user-initiated; runs anytime) ──────────
                 import threading
@@ -155,13 +175,19 @@ class Command(BaseCommand):
                 # and CLOSE it before the next opens. The default account also runs
                 # inbox/manual + heavy enrichment inside its own open window.
                 sync_requested = INBOX_FLAG.exists()
+                # A full inbox sync runs when the Unibox button asked for one, OR at a
+                # scheduled ~3x/day slot. Either way it's a READ (allowed off-hours).
+                do_sync = sync_requested or full_sync_due
                 for acct in accounts:
                     is_default = bool(fallback and acct.pk == fallback.pk)
                     if acct.auto_paused_at is not None:
                         skipped.append(acct.linkedin_username + "(paused)")
                         continue
-                    if not in_session(acct, now_dt):
-                        # Outside working hours — close any open browser, do nothing.
+                    in_sess = in_session(acct, now_dt)
+                    if not in_sess and not do_sync:
+                        # Off-hours and no inbox read requested — skip. (An on-demand
+                        # Unibox sync is a READ, so it's allowed off-hours; sending is
+                        # still gated by in_sess below.)
                         get_or_create_session(acct).close_browser()
                         asleep.append(acct.linkedin_username)
                         continue
@@ -171,9 +197,9 @@ class Command(BaseCommand):
                         continue
                     # Open only when there's work: a non-default account opens for its
                     # due sequence steps; the default also opens for due inbox/heavy.
-                    has_send_work = bool(groups.get(acct.pk))
-                    default_work = is_default and (inbox_due or heavy_due)
-                    if not has_send_work and not default_work and not sync_requested:
+                    has_send_work = in_sess and bool(groups.get(acct.pk))
+                    default_work = is_default and in_sess and (inbox_due or heavy_due)
+                    if not has_send_work and not default_work and not do_sync:
                         get_or_create_session(acct).close_browser()
                         continue
                     session = get_or_create_session(acct)
@@ -190,16 +216,17 @@ class Command(BaseCommand):
                             logger.warning("Account %s unavailable — skipping: %s", acct.linkedin_username, exc)
                             continue
                         acct_cooldown.pop(acct.pk, None)
-                        try:
-                            executed += run_states(session, groups.get(acct.pk, []))
-                            ran.append(acct.linkedin_username)
-                        except AuthenticationError as exc:
-                            auto_pause(acct, "LinkedIn 401 during sending (%s)" % exc)
+                        if in_sess:
+                            try:
+                                executed += run_states(session, groups.get(acct.pk, []))
+                                ran.append(acct.linkedin_username)
+                            except AuthenticationError as exc:
+                                auto_pause(acct, "LinkedIn 401 during sending (%s)" % exc)
                         # If sending just auto-paused this account (401 / restriction
                         # page), do NOT then run inbox/reply-poll/enrichment on the
                         # same flagged session this cycle — that was the ~1,038x
                         # reply-poll hammer. It's skipped from the next cycle anyway.
-                        if is_default and acct.auto_paused_at is None:
+                        if is_default and in_sess and acct.auto_paused_at is None:
                             paused_now = False
                             if inbox_due:
                                 try:
@@ -221,14 +248,15 @@ class Command(BaseCommand):
                         # in its own block above). Without this, a reply on another
                         # account never flips the lead to stopped_reply, so it keeps
                         # getting follow-ups — the exact "if they replied, stop" rule.
-                        if inbox_due and not is_default and acct.auto_paused_at is None:
+                        if inbox_due and in_sess and not is_default and acct.auto_paused_at is None:
                             try:
                                 poll_replies(session, limit=12)
                             except AuthenticationError as exc:
                                 auto_pause(acct, "LinkedIn 401 during reply-poll (%s)" % exc)
-                        # On-demand inbox sync for THIS account (Unibox 'Sync') — runs
-                        # for EVERY account so non-default ones (e.g. Toby's) sync too.
-                        if sync_requested and acct.auto_paused_at is None:
+                        # Full inbox sync for THIS account — Unibox button OR the
+                        # ~3x/day schedule; every account so non-default ones (Toby's)
+                        # sync too. Runs off-hours (it's a read).
+                        if do_sync and acct.auto_paused_at is None:
                             try:
                                 synced = sync_inbox(session)
                                 extra += f" synced[{acct.linkedin_username}]={synced}"
@@ -240,6 +268,10 @@ class Command(BaseCommand):
 
                 if sync_requested:
                     INBOX_FLAG.unlink(missing_ok=True)
+                if full_sync_due:  # mark the slot(s) that just fired so each runs once/day
+                    for i, t in enumerate(sync_targets):
+                        if now_dt >= t:
+                            slots_done.add(i)
                 consecutive_errors = 0
                 note = ""
                 if ran:
