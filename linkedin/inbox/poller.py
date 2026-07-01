@@ -6,11 +6,12 @@ Polls each active sequence lead's LinkedIn conversation; persists messages as
 reply has arrived since the lead's last action, sets ``LeadCampaignState`` to
 ``stopped_reply`` so the sequence never messages a lead who answered.
 
-``fetch_thread_messages`` is the single mockable boundary over ``linkedin_cli``.
-NOTE: ``get_conversation`` returns only ``{sender, text, timestamp}`` — it drops
-the Voyager entityUrn — so direction is inferred by sender name and the message
-id is synthesised from a content hash. Refining this needs a ``linkedin_cli``
-change (tracked for the M4-era cli fork).
+Reply detection is CONVERSATION-DRIVEN: ``sync_inbox`` lists the real inbox and
+matches each conversation to a lead by participant URN, so a message can only ever
+land in the owning thread. The send-time guard ``has_new_reply`` reads a single
+lead's conversation via ``fetch_thread_messages`` (the mockable boundary), matched
+by participant URN only — never LinkedIn's messaging-page navigation fallback,
+which captured whatever thread was on screen and caused cross-lead misattribution.
 """
 from __future__ import annotations
 
@@ -43,24 +44,42 @@ def _self_name(session) -> str:
 
 def fetch_thread_messages(session, lead) -> list[dict]:
     """Return ``[{linkedin_message_id, direction, body, sent_at}]`` for the lead's
-    conversation. Mocked in tests; thin wrapper over ``linkedin_cli`` in prod.
+    conversation, matched by PARTICIPANT URN only. Mockable test boundary.
+
+    Never uses linkedin_cli's messaging-page navigation fallback (which captured
+    whatever thread the page rendered — the account's most-recent chat — and was
+    the cause of cross-lead misattribution). We match the real conversation by
+    participant, or fall back to the owner thread's already participant-verified
+    ``linkedin_thread_id`` (written only by ``sync_inbox``) — never "what's on screen".
     """
-    from linkedin_cli.actions.conversations import get_conversation
+    from linkedin_cli.actions.conversations import find_conversation_urn, parse_messages
+    from linkedin_cli.api.client import PlaywrightLinkedinAPI
+    from linkedin_cli.api.messaging import fetch_messages
+
+    from linkedin.models import MessageThread
 
     target_urn = getattr(lead, "urn", None)
     mailbox_urn = (session.self_profile or {}).get("urn")
-    if not target_urn or not mailbox_urn:
-        return []
-    if target_urn == mailbox_urn:
-        # The lead IS this account's own holder (an operator enrolled as a lead).
-        # get_conversation(self, self) returns the account's OWN inbox, which would
-        # contaminate the lead's thread with a stranger's chat — never self-fetch.
+    if not target_urn or not mailbox_urn or target_urn == mailbox_urn:
         return []
 
-    convo = get_conversation(session, target_urn, mailbox_urn) or []
+    session.ensure_browser()
+    api = PlaywrightLinkedinAPI(session=session)
+    conv_urn = find_conversation_urn(api, target_urn, mailbox_urn)
+    if not conv_urn:
+        # Off the recent-conversations page: use the owner thread's stored,
+        # participant-verified conversation id — never a page navigation.
+        conv_urn = (
+            MessageThread.objects.filter(
+                lead=lead, account=session.linkedin_profile, contacted_by_tool=True,
+            ).values_list("linkedin_thread_id", flat=True).first()
+        ) or ""
+    if not conv_urn:
+        return []
+
     me = _self_name(session)
     out = []
-    for m in convo:
+    for m in parse_messages(fetch_messages(api, conv_urn) or {}):
         sender = m.get("sender", "")
         ts = m.get("timestamp", "")
         out.append({
@@ -192,14 +211,15 @@ def has_new_reply(session, state) -> bool:
         _safety_hold_warning(state, f"reply-check fetch error: {exc!r}")
         raise ReplyCheckUnverified(state.lead_id) from exc
     if not messages:
-        from linkedin.models import Message
-        # last_action_at is set by the CONNECT send too, so at the FIRST message step
-        # the conversation is legitimately empty (only an invite was sent — it lives
-        # outside the message thread). If we've never sent this lead a MESSAGE, they
-        # cannot have replied to one, so an empty thread is safe → send. We only
-        # fail closed once a real outbound message exists (a genuine follow-up where
-        # an empty read means we couldn't verify).
-        sent_before = Message.objects.filter(thread__lead=state.lead, direction="out").exists()
+        from linkedin.models import MessageThread
+        # "Have we messaged them?" keys on the contacted_by_tool thread written at
+        # send time by _mark_contacted — NOT a re-read message row the sender never
+        # persists — so a follow-up whose conversation we can't read now fails CLOSED
+        # (holds). At the FIRST message step no contacted thread exists yet (only an
+        # invite was sent), so an empty read is safe → send.
+        sent_before = MessageThread.objects.filter(
+            lead=state.lead, contacted_by_tool=True,
+        ).exists()
         if not sent_before:
             return False
         _safety_hold_warning(state, "reply-check returned no messages for a contacted lead")
@@ -208,126 +228,6 @@ def has_new_reply(session, state) -> bool:
         if m["direction"] == "in" and m["sent_at"] and m["sent_at"] > state.last_action_at:
             return True
     return False
-
-
-def poll_replies(session, campaign=None, limit=None) -> int:
-    """Poll active sequence leads; persist messages; stop any that replied.
-    Returns the number of states transitioned to ``stopped_reply``.
-
-    ``limit`` bounds how many leads are scanned per call (each scan is a live
-    Voyager conversation fetch) — the worker passes a small bound and orders by
-    most-recent activity so each cycle stays fast and coverage rotates.
-    """
-    from linkedin.models import LeadCampaignState, Message, MessageThread
-
-    State = LeadCampaignState.State
-    # Poll active leads (to stop on reply) AND finished/paused ones (so the
-    # unibox keeps syncing replies that arrive after a sequence completes).
-    pollable = [State.ACTIVE, State.COMPLETED, State.STOPPED_REPLY, State.PAUSED_MANUAL]
-    qs = LeadCampaignState.objects.filter(state__in=pollable)
-    if campaign is not None:
-        qs = qs.filter(campaign=campaign)
-    # Only the OWNING account polls a lead's conversation: the account that made the
-    # connection holds the only real thread. Polling under another account fetches an
-    # empty/foreign mailbox and spawns a junk per-account thread (the "3 empty threads
-    # per lead" bug). Pre-connect leads (no owner yet) have nothing to poll.
-    qs = qs.filter(sending_account=session.linkedin_profile)
-    qs = qs.select_related("lead", "campaign")
-    if limit:
-        # Rotate coverage by least-recently-polled so EVERY pollable lead is
-        # eventually scanned — not just the top-N by recent activity (which would
-        # never re-poll completed/stopped leads, whose last_action_at is frozen,
-        # so a reply arriving after a sequence finished would never sync). We sort
-        # by the lead's thread last_polled_at, nulls (never polled) first.
-        from django.db.models import F, Min
-
-        qs = (
-            qs.annotate(_polled=Min("lead__threads__last_polled_at"))
-            .order_by(F("_polled").asc(nulls_first=True), "last_action_at")[:limit]
-        )
-
-    stopped = 0
-    for state in qs:
-        messages = fetch_thread_messages(session, state.lead)
-        thread, _ = MessageThread.objects.get_or_create(
-            lead=state.lead, account=session.linkedin_profile,
-        )
-
-        inbound_reply = False
-        latest_ts = thread.last_message_at
-        # Unibox gate: an outbound message dated at/after we enrolled this lead is
-        # us contacting them — as opposed to the account's pre-existing LinkedIn
-        # conversations (from other tools), which pre-date enrollment.
-        our_outbound = thread.contacted_by_tool
-        new_reply = None  # newest genuinely-new inbound reply, for Slack notify
-        for m in messages:
-            if (
-                m["direction"] == "out"
-                and m["sent_at"]
-                and state.created_at
-                and m["sent_at"] >= state.created_at
-            ):
-                our_outbound = True
-            # Reconcile a manual Unibox send: when we re-fetch the conversation,
-            # our own outbound reply comes back with a synthesised id that differs
-            # from the "manual-…" id we stored at queue time. Re-key the existing
-            # manual row to the real id so the get_or_create below matches it
-            # instead of inserting a duplicate.
-            if m["direction"] == "out":
-                manual = Message.objects.filter(
-                    thread=thread, direction="out", sent_via_tool=True, body=m["body"],
-                    linkedin_message_id__startswith="manual-",
-                ).first()
-                if manual is not None and manual.linkedin_message_id != m["linkedin_message_id"]:
-                    manual.linkedin_message_id = m["linkedin_message_id"]
-                    if m["sent_at"]:
-                        manual.sent_at = m["sent_at"]
-                    manual.save(update_fields=["linkedin_message_id", "sent_at"])
-            _obj, created = Message.objects.get_or_create(
-                thread=thread,
-                linkedin_message_id=m["linkedin_message_id"],
-                defaults={
-                    "direction": m["direction"],
-                    "body": m["body"],
-                    "sent_at": m["sent_at"],
-                    "sent_via_tool": False,
-                    "sender_account": session.linkedin_profile if m["direction"] == "out" else None,
-                },
-            )
-            if m["sent_at"] and (latest_ts is None or m["sent_at"] > latest_ts):
-                latest_ts = m["sent_at"]
-            # A reply only counts once we've actually acted (sent something) and
-            # the inbound message post-dates that action — otherwise historical
-            # messages would stop a sequence before it even starts.
-            if (
-                m["direction"] == "in"
-                and state.last_action_at
-                and m["sent_at"]
-                and m["sent_at"] > state.last_action_at
-            ):
-                inbound_reply = True
-                if created:  # only ping Slack for messages we haven't seen before
-                    new_reply = m
-
-        thread.last_polled_at = timezone.now()
-        thread.last_message_at = latest_ts
-        if inbound_reply:
-            thread.has_inbound_reply = True
-        if our_outbound:
-            thread.contacted_by_tool = True
-        thread.save()
-
-        # Slack: notify on a brand-new reply to a conversation we started.
-        if new_reply and (our_outbound or thread.contacted_by_tool):
-            _notify_reply(state.lead, new_reply["body"], session)
-
-        if inbound_reply and state.state == State.ACTIVE:
-            state.state = State.STOPPED_REPLY
-            state.save(update_fields=["state"])
-            stopped += 1
-            logger.info("Lead %s replied — sequence stopped", state.lead_id)
-
-    return stopped
 
 
 def sync_inbox(session, limit=40) -> int:
@@ -341,7 +241,7 @@ def sync_inbox(session, limit=40) -> int:
     the number of threads that gained new messages.
     """
     from crm.models import Lead
-    from linkedin.models import Message, MessageThread
+    from linkedin.models import LeadCampaignState, Message, MessageThread
     from linkedin_cli.actions.conversations import parse_messages
     from linkedin_cli.api.client import PlaywrightLinkedinAPI
     from linkedin_cli.api.messaging import fetch_conversations, fetch_messages
@@ -387,15 +287,36 @@ def sync_inbox(session, limit=40) -> int:
         if not thread.linkedin_thread_id:
             thread.linkedin_thread_id = conv_urn
 
+        # A lead is enrolled in at most one live sequence, so its states share one
+        # last action; a reply after it stops the lead's ACTIVE state(s).
+        states = list(LeadCampaignState.objects.filter(lead=lead))
+        last_action = max((s.last_action_at for s in states if s.last_action_at), default=None)
+        newest_reply = None  # (body, created) of the newest inbound after our last action
+
         latest = thread.last_message_at
         gained = False
         for m in parse_messages(fetch_messages(api, conv_urn) or {}):
             sender = m.get("sender", "")
-            ts = _parse_ts(m.get("timestamp", ""))
+            raw_ts = m.get("timestamp", "")
+            ts = _parse_ts(raw_ts)
             direction = "out" if sender == me else "in"
+            synth = _synth_id(sender, m.get("text", ""), raw_ts)
+            # Reconcile a manual Unibox send: our own reply comes back with a synth id
+            # differing from the "manual-…" id stored at queue time — re-key it so the
+            # get_or_create below matches instead of inserting a duplicate.
+            if direction == "out":
+                manual = Message.objects.filter(
+                    thread=thread, direction="out", sent_via_tool=True, body=m.get("text", ""),
+                    linkedin_message_id__startswith="manual-",
+                ).first()
+                if manual is not None and manual.linkedin_message_id != synth:
+                    manual.linkedin_message_id = synth
+                    if ts:
+                        manual.sent_at = ts
+                    manual.save(update_fields=["linkedin_message_id", "sent_at"])
             _obj, created = Message.objects.get_or_create(
                 thread=thread,
-                linkedin_message_id=_synth_id(sender, m.get("text", ""), m.get("timestamp", "")),
+                linkedin_message_id=synth,
                 defaults={
                     "direction": direction,
                     "body": m.get("text", ""),
@@ -409,12 +330,25 @@ def sync_inbox(session, limit=40) -> int:
                 latest = ts
             if direction == "in":
                 thread.has_inbound_reply = True
+                if last_action and ts and ts > last_action:
+                    newest_reply = (m.get("text", ""), created)
 
         thread.last_message_at = latest
         thread.last_polled_at = timezone.now()
         thread.save()
         if gained:
             updated += 1
+
+        # A genuine inbound after our last action stops the sequence (misattribution-
+        # proof: it reached the owner thread) and pings Slack once for a new reply.
+        if newest_reply is not None:
+            for s in states:
+                if s.state == LeadCampaignState.State.ACTIVE:
+                    s.state = LeadCampaignState.State.STOPPED_REPLY
+                    s.save(update_fields=["state"])
+                    logger.info("Lead %s replied — sequence stopped", lead.id)
+            if newest_reply[1]:  # created → not seen before
+                _notify_reply(lead, newest_reply[0], session)
 
     return updated
 

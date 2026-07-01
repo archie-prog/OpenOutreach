@@ -49,6 +49,11 @@ _RETRY_BACKOFF = [
 # next_action_due_at to its real value, so the lease only lingers after a crash.
 CLAIM_LEASE = timedelta(minutes=30)
 
+# A send-time reply check that couldn't confirm "no reply" (unreadable/off-page
+# conversation) HOLDS the follow-up and retries — a safety defer, NOT a step
+# failure, so it must never accrue error_count toward STOPPED_ERROR.
+REPLY_CHECK_HOLD = timedelta(hours=3)
+
 
 # ── Enrollment ────────────────────────────────────────────────────────
 
@@ -229,6 +234,8 @@ def _run_one(session, state) -> bool:
     refused), deferred (cap/pacing), or failed. Never raises: a failing step is
     retried/parked via ``_record_step_failure`` so one bad lead never halts the
     rest of the batch."""
+    from linkedin.inbox.poller import ReplyCheckUnverified
+
     if not _claim(state):
         return False  # no longer ACTIVE+due (reply/pause/raced) — skip
     try:
@@ -241,6 +248,12 @@ def _run_one(session, state) -> bool:
         # session (the June-9 failure mode). The claimed lead stays ACTIVE and
         # re-runs once the account is recovered.
         raise
+    except ReplyCheckUnverified:
+        # Couldn't confirm the lead hasn't replied → HOLD + retry (fail-closed),
+        # never park STOPPED_ERROR. A defer, not a step failure: leave error_count.
+        LeadCampaignState.objects.filter(pk=state.pk).update(
+            next_action_due_at=timezone.now() + REPLY_CHECK_HOLD)
+        return False
     except Exception as exc:
         logger.exception("Sequence step failed for %s", state)
         _record_step_failure(state, exc)

@@ -29,7 +29,7 @@ class Command(BaseCommand):
         from linkedin.browser.registry import get_first_active_profile, get_or_create_session
         from pathlib import Path
 
-        from linkedin.inbox.poller import poll_replies, process_pending_sends, sync_inbox
+        from linkedin.inbox.poller import process_pending_sends, sync_inbox
         from linkedin.leads.importer import backfill_lead_profiles, process_pending_searches
         from linkedin.ml.lead_score import score_pending_leads
         from linkedin.models import LeadList, LinkedInProfile
@@ -154,7 +154,7 @@ class Command(BaseCommand):
 
                 executed = 0
                 ran, skipped, asleep = [], [], []
-                manual = stopped = 0
+                manual = 0
                 extra = ""
                 heavy_due = (time.monotonic() - last_heavy) >= HEAVY_EVERY
                 inbox_due = (time.monotonic() - last_inbox) >= INBOX_EVERY
@@ -276,21 +276,6 @@ class Command(BaseCommand):
                                 ran.append(acct.linkedin_username)
                             except AuthenticationError as exc:
                                 auto_pause(acct, "LinkedIn 401 during sending (%s)" % exc)
-                        # Reply-poll is ANCHORED TO SEND ACTIVITY (request: "the reply
-                        # check must align with when messages are sent"): poll on this
-                        # same open session right after the account sends (did_send),
-                        # not on an independent fixed timer (a regular cadence is itself
-                        # a behavioural tell). inbox_due is only a slow within-window
-                        # fallback so post-send waiting leads still get polled if the
-                        # account is idle. poll_replies is owner-scoped (each account
-                        # polls only its own leads). Skipped if sending just auto-paused
-                        # this account — that was the ~1,038x reply-poll hammer.
-                        if in_sess and acct.auto_paused_at is None and (did_send or inbox_due):
-                            try:
-                                stopped += poll_replies(session, limit=12)
-                                last_inbox = time.monotonic()
-                            except AuthenticationError as exc:
-                                auto_pause(acct, "LinkedIn 401 during reply-poll (%s)" % exc)
                         # Default account drains any leftover manual sends (backstop to
                         # the instant .manual_send path; scoped to its own pending) and
                         # runs heavy enrichment, inside its own open window.
@@ -307,13 +292,19 @@ class Command(BaseCommand):
                                     extra += f" backfilled={backfilled} scored={scored}"
                                 except AuthenticationError as exc:
                                     auto_pause(acct, "LinkedIn 401 during enrichment (%s)" % exc)
-                        # Full inbox sync for THIS account — Unibox button OR the
-                        # ~3x/day schedule; every account so non-default ones (Toby's)
-                        # sync too. Runs off-hours (it's a read).
-                        if do_sync and acct.auto_paused_at is None:
+                        # Reply detection is CONVERSATION-DRIVEN (sync_inbox matches the
+                        # real participant → misattribution-proof). Fire on the Unibox/
+                        # scheduled sync, OR send-anchored (right after this account sent,
+                        # or the slow inbox_due within-window fallback) — never a fixed
+                        # cadence (a regular beat is itself a tell). Every account syncs
+                        # (Toby's too); it's a read, so off-hours is fine.
+                        send_anchored = in_sess and (did_send or inbox_due)
+                        if acct.auto_paused_at is None and (do_sync or send_anchored):
                             try:
                                 synced = sync_inbox(session)
                                 extra += f" synced[{acct.linkedin_username}]={synced}"
+                                if send_anchored:
+                                    last_inbox = time.monotonic()  # keep the 300s floor
                             except AuthenticationError as exc:
                                 auto_pause(acct, "LinkedIn 401 during inbox sync (%s)" % exc)
                     finally:
@@ -336,7 +327,7 @@ class Command(BaseCommand):
                     note += f" skipped={','.join(skipped)}"
                 self.stdout.write(
                     f"cycle: executed={executed} enrolled={enrolled['enrolled']} "
-                    f"manual_sent={manual} replies_stopped={stopped}{extra}{note}")
+                    f"manual_sent={manual}{extra}{note}")
             except CycleTimeout:
                 # Hung browser op — exit for a clean systemd relaunch (reuses cookies +
                 # identical fingerprint: no re-login, no send burst, no detection signal).

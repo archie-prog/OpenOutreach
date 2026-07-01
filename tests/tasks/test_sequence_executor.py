@@ -73,6 +73,9 @@ class TestSequenceExecutor:
         campaign = _campaign_with_leads(owner, fake_session, _build_sequence(owner), n=3)
         executor.enroll_campaign(campaign)
 
+        # These leads have no urn, so the live reply-check reads an empty
+        # conversation; this test walks sequence progression, not reply detection,
+        # so treat every lead as not-yet-replied (has_new_reply is covered separately).
         with patch.multiple(
             executor,
             connection_status=lambda *a, **k: "not_connected",
@@ -80,7 +83,7 @@ class TestSequenceExecutor:
             is_connection_accepted=lambda *a, **k: True,
             send_message=lambda *a, **k: None,
             send_inmail=lambda *a, **k: {"success": True},
-        ):
+        ), patch("linkedin.inbox.poller.has_new_reply", lambda *a, **k: False):
             _drive(executor, fake_session, campaign)
 
         states = LeadCampaignState.objects.filter(campaign=campaign)
