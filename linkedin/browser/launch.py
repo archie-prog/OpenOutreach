@@ -159,8 +159,8 @@ def start_browser_session(session):
     if not storage_state:
         _fresh_login(session)
     else:
-        session.page.goto(LINKEDIN_FEED_URL)
-        dismiss_comply_gate(session.page)
+        session.page.goto(LINKEDIN_FEED_URL, wait_until="domcontentloaded")
+        dismiss_comply_gate(session.page, timeout_ms=1200)
         try:
             goto_page(
                 session,
