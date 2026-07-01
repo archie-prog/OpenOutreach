@@ -147,6 +147,33 @@ class TestSyncInboxReplyStop:
         assert Message.objects.filter(thread=thread, direction="out").count() == 1
         assert not Message.objects.filter(linkedin_message_id="manual-abc").exists()
 
+    def test_rekey_skipped_when_synth_already_exists(self, fake_session):
+        # Legacy data: a thread already holds BOTH a manual- row and its synth twin.
+        # Re-keying would hit the (thread, id) unique constraint — it must be skipped,
+        # not crash the sync. Exercise the ingest path directly (no wrapper to mask).
+        from linkedin.inbox import poller
+        from linkedin.models import Message
+
+        lead = _lead()
+        _state(fake_session, lead)
+        thread = _contacted_thread(fake_session, lead, "urn:li:msg:CONV1")
+        msg = _msg("dup reply", minutes_ago=1, sender="Diego Ramirez")
+        synth = poller._synth_id("Diego Ramirez", "dup reply", msg["timestamp"])
+        Message.objects.create(thread=thread, direction="out", body="dup reply",
+                               sent_via_tool=True, linkedin_message_id="manual-xyz")
+        Message.objects.create(thread=thread, direction="out", body="dup reply",
+                               linkedin_message_id=synth)
+        conv = {"entityUrn": "urn:li:msg:CONV1", "conversationParticipants": [
+            {"hostIdentityUrn": fake_session.self_profile["urn"]},
+            {"hostIdentityUrn": lead.urn}]}
+        with patch("linkedin_cli.api.messaging.fetch_messages", return_value={}), \
+             patch("linkedin_cli.actions.conversations.parse_messages", return_value=[msg]):
+            poller._ingest_conversation(
+                fake_session, object(), fake_session.linkedin_profile,
+                fake_session.self_profile["urn"], conv)
+
+        assert Message.objects.filter(thread=thread, direction="out").count() == 2
+
 
 @pytest.mark.django_db
 class TestHasNewReplyFailClosed:
