@@ -129,7 +129,9 @@
     .threadrow.unread .nm { font-weight: 800; }
     .threadrow .pre { font-size: 12px; color: #6b7280; margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .acctbadge { font-size: 10px; background: #e0e7ff; color: #3730a3; border-radius: 6px; padding: 1px 6px; font-weight: 600; }
-    .dot { width: 8px; height: 8px; border-radius: 50%; background: #2563eb; display: inline-block; }
+    .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; flex: 0 0 auto; margin-right: 2px; }
+    .dot.unreaddot { background: #2563eb; box-shadow: 0 0 0 2px #dbeafe; }
+    .dot.readdot { background: transparent; border: 1.5px solid #cbd5e1; }
     .convo { flex: 1; overflow-y: auto; background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 16px; }
     .convohead { font-weight: 700; font-size: 15px; padding-bottom: 10px; border-bottom: 1px solid #f1f5f9; margin-bottom: 12px; }
     .msg { max-width: 70%; padding: 8px 12px; border-radius: 12px; margin: 6px 0; font-size: 13px; line-height: 1.4; white-space: pre-wrap; }
@@ -931,7 +933,7 @@
         if (!d.threads.length){ list.innerHTML = `<div class="hint" style="padding:16px">No conversations yet.</div>`; return; }
         list.innerHTML = d.threads.map(t => `
           <div class="threadrow ${t.unread?"unread":""} ${t.id===CUR_THREAD?"sel":""}" onclick="openThread(${t.id})">
-            <div class="nm">${t.unread?'<span class="dot"></span>':""}${esc(t.lead_name)} <span class="acctbadge" title="LinkedIn account">${esc(t.account_name)}</span><button onclick="event.stopPropagation();archiveThread(${t.id}, true)" title="Hide conversation & exclude from stats" style="float:right;border:none;background:none;cursor:pointer;color:#9ca3af;font-size:12px">✕ Hide</button></div>
+            <div class="nm"><span class="dot ${t.unread?'unreaddot':'readdot'}" title="${t.unread?'Unread':'Read'}"></span>${esc(t.lead_name)} <span class="acctbadge" title="LinkedIn account">${esc(t.account_name)}</span><button onclick="event.stopPropagation();archiveThread(${t.id}, true)" title="Hide conversation & exclude from stats" style="float:right;border:none;background:none;cursor:pointer;color:#9ca3af;font-size:12px">✕ Hide</button></div>
             <div class="pre">${t.last_direction==="out"?"You: ":""}${esc(t.last_message||"")}</div>
           </div>`).join("");
       });
@@ -959,11 +961,11 @@
           t.messages.map(m => {
             const who = m.direction==="out" ? ("You ("+esc(t.account_name)+")") : esc(t.lead_name);
             const stateCls = m.pending ? "pending" : (m.failed ? "failed" : "");
-            const stateNote = m.pending ? `<div class="sendstate pending">⏳ queued — sending on the next worker cycle</div>`
+            const stateNote = m.pending ? `<div class="sendstate pending">⏳ sending now…</div>`
               : (m.failed ? `<div class="sendstate failed">⚠️ failed to send${m.send_error?(": "+esc(m.send_error)):""}</div>` : "");
             return `<div class="msg ${m.direction} ${stateCls}"><div class="who">${who}</div>${esc(m.body||"")}${stateNote}</div>`;
           }).join("") +
-          `<div style="margin-top:14px;display:flex;gap:8px"><input id="composebox" placeholder="Type a reply, sent from ${esc(t.account_name)}…" style="flex:1" onkeydown="if(event.key==='Enter')sendMsg(${id})"><button onclick="sendMsg(${id})" style="background:#2563eb;color:#fff;border:none;border-radius:6px;padding:7px 16px;cursor:pointer">Send</button></div>`;
+          `<div style="margin-top:14px;display:flex;gap:8px;align-items:flex-end"><textarea id="composebox" rows="2" placeholder="Type a reply, sent from ${esc(t.account_name)}…  (Enter to send · Shift+Enter for a new line)" style="flex:1;resize:vertical;font-family:inherit;font-size:inherit;padding:7px;border:1px solid #d1d5db;border-radius:6px" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMsg(${id})}"></textarea><button id="suggestbtn" onclick="suggestReply(${id})" title="Draft a reply with AI" style="background:#f3f4f6;color:#374151;border:1px solid #d1d5db;border-radius:6px;padding:7px 12px;cursor:pointer;white-space:nowrap">✨ Suggest</button><button onclick="sendMsg(${id})" style="background:#2563eb;color:#fff;border:none;border-radius:6px;padding:7px 16px;cursor:pointer">Send</button></div>`;
         loadThreads();
       });
     };
@@ -983,6 +985,14 @@
       box.disabled = true;
       j(`api/inbox/thread/${id}/send/`, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({body})})
         .then(r => { if(r.ok){ openThread(id); } else { box.disabled=false; alert(r.error||"send failed"); } });
+    };
+    window.suggestReply = (id) => {
+      const box = document.getElementById("composebox"), btn = document.getElementById("suggestbtn");
+      if(btn){ btn.disabled = true; btn.textContent = "✨ Thinking…"; }
+      j(`api/inbox/thread/${id}/suggest/`)
+        .then(r => { if(r && r.text){ box.value = r.text; box.focus(); } else { alert((r&&r.error)||"suggest failed"); } })
+        .catch(() => alert("suggest failed"))
+        .finally(() => { if(btn){ btn.disabled = false; btn.textContent = "✨ Suggest"; } });
     };
 
     function loadLeads(){

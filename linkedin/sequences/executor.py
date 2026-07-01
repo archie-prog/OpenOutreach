@@ -269,8 +269,15 @@ def _account_for_state(state):
     pre-connect (unowned). Ownership is appointed only when the connect request is
     actually sent (``_handle_connect``) and never changes afterwards — a lead's
     whole sequence stays on the one identity that made its connection (anti-ban
-    Rule #6: a mid-sequence identity switch is a cross-account correlation signal)."""
-    return state.sending_account if state.sending_account_id else None
+    Rule #6: a mid-sequence identity switch is a cross-account correlation signal).
+
+    Guard on ``last_action_at``: ownership is stamped atomically with the connect
+    SEND (which also sets ``last_action_at``), so a pre-connect row carrying a
+    ``sending_account`` but no action yet is NOT a real owner — honoring it would
+    pin the whole pool to one account; treat it as unowned -> shared round-robin."""
+    if state.sending_account_id and state.last_action_at is not None:
+        return state.sending_account
+    return None
 
 
 def due_states_by_account(fallback_profile):

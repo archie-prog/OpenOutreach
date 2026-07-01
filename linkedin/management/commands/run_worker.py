@@ -1,5 +1,7 @@
 import logging
+import os
 import random
+import signal
 import time
 import traceback
 from datetime import timedelta
@@ -7,6 +9,11 @@ from datetime import timedelta
 from django.core.management.base import BaseCommand
 
 logger = logging.getLogger(__name__)
+
+
+class CycleTimeout(Exception):
+    """Raised by the SIGALRM watchdog when one cycle blows its deadline — a hung
+    browser op that would otherwise freeze every account for the rest of the day."""
 
 
 class Command(BaseCommand):
@@ -44,9 +51,14 @@ class Command(BaseCommand):
         # the worker runs sync_inbox when it's present, then clears it — so LinkedIn
         # is read for messages only when you ask, never on a constant timer.
         INBOX_FLAG = Path("/app/data/.inbox_sync")
+        # The Unibox drops this when you hit Send on a manual reply; the worker drains
+        # it IMMEDIATELY (any hour), sending from each message's owning account.
+        MANUAL_FLAG = Path("/app/data/.manual_send")
         HEAVY_EVERY = 600        # heavy enrichment/scoring cadence (seconds)
         INBOX_EVERY = 300        # reply-poll / manual-send cadence (seconds)
         REAUTH_COOLDOWN = 1800   # don't re-attempt a failing account's login more than this often
+        CYCLE_BUDGET = 900       # per-cycle hard deadline; a hang past this exits the worker for a
+                                 # clean systemd relaunch (single-threaded loop → 1 hang = whole day lost)
         last_heavy = 0.0
         last_inbox = 0.0
         # Full inbox sync runs ~3x/day at jittered human-hour slots (morning, lunch,
@@ -63,6 +75,10 @@ class Command(BaseCommand):
         self.stdout.write(self.style.SUCCESS(
             "worker started — working-hours mode (each account opens a session at a random "
             "time in the first 30 min of its window and closes near the end; nothing runs overnight)"))
+
+        def _on_cycle_deadline(signum, frame):
+            raise CycleTimeout()
+        signal.signal(signal.SIGALRM, _on_cycle_deadline)
 
         def acquire_session(acct):
             if not acct.cookie_data and not acct.totp_secret and not acct.password_login_ok:
@@ -91,6 +107,7 @@ class Command(BaseCommand):
         while True:
             from django.db import connection
             connection.close()
+            signal.alarm(CYCLE_BUDGET)  # arm the per-cycle watchdog
             try:
                 now_dt = timezone.now()
                 if now_dt.date() != sync_day:
@@ -169,6 +186,40 @@ class Command(BaseCommand):
                         finally:
                             s_session.close_browser()
 
+                # ── Manual Unibox sends (user-initiated; INSTANT, any hour) ────
+                # When you hit Send the Unibox drops .manual_send; drain it NOW from
+                # each message's OWNING account on the serialized browser, bypassing
+                # the send window (a human replying at any hour is genuine). Auto/kit
+                # sends stay window-gated + paced; only these human sends skip it.
+                if MANUAL_FLAG.exists():
+                    from linkedin.models import Message
+                    owner_ids = set()
+                    for m in (Message.objects.filter(pending_send=True)
+                              .select_related("sender_account", "thread__account")):
+                        owner = m.sender_account or m.thread.account
+                        if owner is not None:
+                            owner_ids.add(owner.pk)
+                    for acct_m in LinkedInProfile.objects.filter(pk__in=owner_ids):
+                        if acct_m.auto_paused_at is not None:
+                            continue
+                        m_cool = acct_cooldown.get(acct_m.pk)
+                        if m_cool is not None and (now_m - m_cool) < REAUTH_COOLDOWN:
+                            continue
+                        if not (acct_m.cookie_data or acct_m.totp_secret or acct_m.password_login_ok):
+                            continue
+                        m_session = get_or_create_session(acct_m)
+                        try:
+                            acquire_session(acct_m)
+                            manual += process_pending_sends(m_session, account=acct_m)
+                        except AuthenticationError as exc:
+                            auto_pause(acct_m, "LinkedIn rejected the session during manual send (%s)" % exc)
+                        except Exception as exc:
+                            acct_cooldown[acct_m.pk] = now_m
+                            logger.warning("Manual send for %s skipped: %s", acct_m.linkedin_username, exc)
+                        finally:
+                            m_session.close_browser()  # serialize: close before the loop opens any
+                    MANUAL_FLAG.unlink(missing_ok=True)
+
                 # Serialize browsers: Playwright's sync API allows only ONE live
                 # instance per OS thread, and concurrent sessions from one IP are a
                 # detection signal — so open at most one account's browser at a time
@@ -216,27 +267,39 @@ class Command(BaseCommand):
                             logger.warning("Account %s unavailable — skipping: %s", acct.linkedin_username, exc)
                             continue
                         acct_cooldown.pop(acct.pk, None)
+                        did_send = False
                         if in_sess:
                             try:
-                                executed += run_states(session, groups.get(acct.pk, []))
+                                ran_n = run_states(session, groups.get(acct.pk, []))
+                                executed += ran_n
+                                did_send = ran_n > 0
                                 ran.append(acct.linkedin_username)
                             except AuthenticationError as exc:
                                 auto_pause(acct, "LinkedIn 401 during sending (%s)" % exc)
-                        # If sending just auto-paused this account (401 / restriction
-                        # page), do NOT then run inbox/reply-poll/enrichment on the
-                        # same flagged session this cycle — that was the ~1,038x
-                        # reply-poll hammer. It's skipped from the next cycle anyway.
+                        # Reply-poll is ANCHORED TO SEND ACTIVITY (request: "the reply
+                        # check must align with when messages are sent"): poll on this
+                        # same open session right after the account sends (did_send),
+                        # not on an independent fixed timer (a regular cadence is itself
+                        # a behavioural tell). inbox_due is only a slow within-window
+                        # fallback so post-send waiting leads still get polled if the
+                        # account is idle. poll_replies is owner-scoped (each account
+                        # polls only its own leads). Skipped if sending just auto-paused
+                        # this account — that was the ~1,038x reply-poll hammer.
+                        if in_sess and acct.auto_paused_at is None and (did_send or inbox_due):
+                            try:
+                                stopped += poll_replies(session, limit=12)
+                                last_inbox = time.monotonic()
+                            except AuthenticationError as exc:
+                                auto_pause(acct, "LinkedIn 401 during reply-poll (%s)" % exc)
+                        # Default account drains any leftover manual sends (backstop to
+                        # the instant .manual_send path; scoped to its own pending) and
+                        # runs heavy enrichment, inside its own open window.
                         if is_default and in_sess and acct.auto_paused_at is None:
-                            paused_now = False
-                            if inbox_due:
-                                try:
-                                    manual = process_pending_sends(session)
-                                    stopped = poll_replies(session, limit=12)
-                                    last_inbox = time.monotonic()
-                                except AuthenticationError as exc:
-                                    auto_pause(acct, "LinkedIn 401 during reply-poll (%s)" % exc)
-                                    paused_now = True
-                            if heavy_due and not paused_now:
+                            try:
+                                manual += process_pending_sends(session, account=acct)
+                            except AuthenticationError as exc:
+                                auto_pause(acct, "LinkedIn 401 during manual send (%s)" % exc)
+                            if heavy_due and acct.auto_paused_at is None:
                                 try:
                                     backfilled = backfill_lead_profiles(session, limit=8)
                                     scored = score_pending_leads(limit=15)
@@ -244,15 +307,6 @@ class Command(BaseCommand):
                                     extra += f" backfilled={backfilled} scored={scored}"
                                 except AuthenticationError as exc:
                                     auto_pause(acct, "LinkedIn 401 during enrichment (%s)" % exc)
-                        # Reply-poll SAFETY for NON-default accounts (the default polls
-                        # in its own block above). Without this, a reply on another
-                        # account never flips the lead to stopped_reply, so it keeps
-                        # getting follow-ups — the exact "if they replied, stop" rule.
-                        if inbox_due and in_sess and not is_default and acct.auto_paused_at is None:
-                            try:
-                                poll_replies(session, limit=12)
-                            except AuthenticationError as exc:
-                                auto_pause(acct, "LinkedIn 401 during reply-poll (%s)" % exc)
                         # Full inbox sync for THIS account — Unibox button OR the
                         # ~3x/day schedule; every account so non-default ones (Toby's)
                         # sync too. Runs off-hours (it's a read).
@@ -283,9 +337,31 @@ class Command(BaseCommand):
                 self.stdout.write(
                     f"cycle: executed={executed} enrolled={enrolled['enrolled']} "
                     f"manual_sent={manual} replies_stopped={stopped}{extra}{note}")
+            except CycleTimeout:
+                # Hung browser op — exit for a clean systemd relaunch (reuses cookies +
+                # identical fingerprint: no re-login, no send burst, no detection signal).
+                signal.alarm(0)
+                logger.error("worker cycle exceeded %ss — hung browser op; exiting for a clean restart", CYCLE_BUDGET)
+                try:
+                    post_text(":rotating_light: OpenOutreach worker hung (>%ss) — auto-restarting for a clean session." % CYCLE_BUDGET)
+                except Exception:
+                    pass
+                self.stdout.flush()
+                self.stderr.flush()
+                os._exit(1)
             except Exception as exc:  # keep the worker alive across transient errors
                 consecutive_errors += 1
                 self.stderr.write(f"cycle error ({consecutive_errors}): {exc!r}")
                 logger.error("Worker cycle error:\n%s", traceback.format_exc())
+            finally:
+                signal.alarm(0)  # never let the alarm fire during the sleep
             sleep_for = interval * (min(consecutive_errors, 5) or 1) if consecutive_errors else interval
-            time.sleep(sleep_for)
+            # Wake within ~3s of a manual Unibox send instead of waiting the full
+            # cycle, so a human reply goes out near-instantly.
+            slept = 0.0
+            while slept < sleep_for:
+                if MANUAL_FLAG.exists():
+                    break
+                step = min(3.0, sleep_for - slept)
+                time.sleep(step)
+                slept += step

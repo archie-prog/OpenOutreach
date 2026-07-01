@@ -51,6 +51,11 @@ def fetch_thread_messages(session, lead) -> list[dict]:
     mailbox_urn = (session.self_profile or {}).get("urn")
     if not target_urn or not mailbox_urn:
         return []
+    if target_urn == mailbox_urn:
+        # The lead IS this account's own holder (an operator enrolled as a lead).
+        # get_conversation(self, self) returns the account's OWN inbox, which would
+        # contaminate the lead's thread with a stranger's chat — never self-fetch.
+        return []
 
     convo = get_conversation(session, target_urn, mailbox_urn) or []
     me = _self_name(session)
@@ -72,14 +77,20 @@ def fetch_thread_messages(session, lead) -> list[dict]:
 MAX_MANUAL_SEND_ATTEMPTS = 3
 
 
-def process_pending_sends(session) -> int:
+def process_pending_sends(session, account=None) -> int:
     """Send any manual replies queued from the Unibox, from the thread's owning
     account. Manual sends are user-initiated, so they're sent immediately (not
     window-gated) but are *recorded* (ActionLog + daily counter) so they show up
     in the activity feed/KPIs and count toward the account's limits. Retries are
     bounded; a permanently-failing send is marked failed, not retried forever.
+
+    ``account`` scopes the drain to that account's OWN pending messages, so a
+    given browser session only ever types into its own logged-in LinkedIn — a
+    reply on Josh's thread is sent from Josh's session, never the default account's
+    (wrong-identity / cross-account correlation bug). ``None`` = drain all (backstop).
     Returns the number sent this cycle.
     """
+    from django.db.models import Q
     from django.utils import timezone
 
     from linkedin.accounts.limits import record_action
@@ -88,6 +99,8 @@ def process_pending_sends(session) -> int:
 
     sent = 0
     pending = Message.objects.filter(pending_send=True).select_related("thread__lead", "thread__account")
+    if account is not None:
+        pending = pending.filter(Q(sender_account=account) | Q(sender_account__isnull=True, thread__account=account))
     for m in pending:
         lead = m.thread.lead
         account = m.sender_account or m.thread.account
@@ -179,8 +192,16 @@ def has_new_reply(session, state) -> bool:
         _safety_hold_warning(state, f"reply-check fetch error: {exc!r}")
         raise ReplyCheckUnverified(state.lead_id) from exc
     if not messages:
-        # We've already messaged this lead, so the conversation must contain our
-        # outbound. An empty result means we couldn't read it — hold, don't send.
+        from linkedin.models import Message
+        # last_action_at is set by the CONNECT send too, so at the FIRST message step
+        # the conversation is legitimately empty (only an invite was sent — it lives
+        # outside the message thread). If we've never sent this lead a MESSAGE, they
+        # cannot have replied to one, so an empty thread is safe → send. We only
+        # fail closed once a real outbound message exists (a genuine follow-up where
+        # an empty read means we couldn't verify).
+        sent_before = Message.objects.filter(thread__lead=state.lead, direction="out").exists()
+        if not sent_before:
+            return False
         _safety_hold_warning(state, "reply-check returned no messages for a contacted lead")
         raise ReplyCheckUnverified(state.lead_id)
     for m in messages:
@@ -206,6 +227,11 @@ def poll_replies(session, campaign=None, limit=None) -> int:
     qs = LeadCampaignState.objects.filter(state__in=pollable)
     if campaign is not None:
         qs = qs.filter(campaign=campaign)
+    # Only the OWNING account polls a lead's conversation: the account that made the
+    # connection holds the only real thread. Polling under another account fetches an
+    # empty/foreign mailbox and spawns a junk per-account thread (the "3 empty threads
+    # per lead" bug). Pre-connect leads (no owner yet) have nothing to poll.
+    qs = qs.filter(sending_account=session.linkedin_profile)
     qs = qs.select_related("lead", "campaign")
     if limit:
         # Rotate coverage by least-recently-polled so EVERY pollable lead is

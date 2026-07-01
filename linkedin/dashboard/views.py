@@ -1122,9 +1122,11 @@ def api_leadlist_events(request, list_id):
 @staff_member_required
 @require_POST
 def api_inbox_send(request, thread_id):
-    """Queue a manual reply typed in the Unibox; the worker sends it from the
-    thread's owning account on its next cycle."""
+    """Queue a manual reply typed in the Unibox and signal the worker to send it
+    IMMEDIATELY from the thread's owning account (it drains .manual_send within a
+    few seconds, any hour — a human replying isn't window-gated)."""
     import hashlib
+    from pathlib import Path
 
     from django.utils import timezone
 
@@ -1139,7 +1141,7 @@ def api_inbox_send(request, thread_id):
         return JsonResponse({"error": "empty message"}, status=400)
     mid = "manual-" + hashlib.sha1((body + str(timezone.now())).encode()).hexdigest()[:16]
     # sent_at stays NULL until the worker actually sends it — the Unibox renders a
-    # "queued" pill while pending_send is True, so the UI never claims a message
+    # "sending" pill while pending_send is True, so the UI never claims a message
     # was sent before it left the browser.
     Message.objects.create(
         thread=t, direction="out", body=body, sent_via_tool=True, pending_send=True,
@@ -1147,7 +1149,61 @@ def api_inbox_send(request, thread_id):
     )
     t.contacted_by_tool = True  # a manual reply is us contacting them
     t.save(update_fields=["contacted_by_tool"])
-    return JsonResponse({"ok": True, "queued": True})
+    try:  # wake the worker now (same shared-volume IPC as the inbox-sync button)
+        Path("/app/data/.manual_send").touch()
+    except Exception:
+        pass
+    return JsonResponse({"ok": True, "sending": True})
+
+
+@staff_member_required
+def api_inbox_suggest(request, thread_id):
+    """Draft an AI reply for a Unibox thread using the SAME Claude client as the
+    lead-list AI (linkedin.llm). Returns {text}; the Unibox drops it into the
+    compose box for the human to edit and send — this NEVER sends, so it cannot
+    auto-message a lead. Read-only (no DB writes)."""
+    from linkedin.models import MessageThread, SiteConfig
+
+    t = MessageThread.objects.select_related("lead", "account").filter(pk=thread_id).first()
+    if not t:
+        return JsonResponse({"error": "not found"}, status=404)
+    lead = t.lead
+    signoff = ((getattr(t.account, "signoff_name", "") or "").strip()
+               or (getattr(t.account, "linkedin_username", "") or "me").split("@")[0])
+    convo = []
+    for m in t.messages.order_by("sent_at", "fetched_at"):
+        if not (m.body or "").strip():
+            continue
+        who = signoff if m.direction == "out" else (lead.first_name or "Them")
+        convo.append(f"{who}: {m.body.strip()}")
+    context = (SiteConfig.load().ai_context or "").strip()
+    lead_bits = [b for b in [
+        (f"{lead.first_name or ''} {lead.last_name or ''}".strip() and
+         f"Name: {lead.first_name or ''} {lead.last_name or ''}".strip()),
+        f"Title: {lead.title}" if getattr(lead, "title", "") else "",
+        f"Company: {lead.company}" if getattr(lead, "company", "") else "",
+        f"Location: {lead.location}" if getattr(lead, "location", "") else "",
+    ] if b]
+    prompt = (
+        f"You are drafting the NEXT reply in a LinkedIn DM conversation, written as {signoff} "
+        "(the person whose account this is). Output ONLY the message body — no name label, "
+        "no quotes, no preamble. Keep it warm, concise, human and matched to the conversation's "
+        "tone; one short paragraph unless a question needs more.\n\n"
+        + (f"WHAT WE DO / IDEAL CUSTOMER:\n{context}\n\n" if context else "")
+        + ("LEAD:\n- " + "\n- ".join(lead_bits) + "\n\n" if lead_bits else "")
+        + "CONVERSATION SO FAR (oldest first):\n"
+        + ("\n".join(convo) if convo else "(no messages yet — this is the opener)")
+        + f"\n\nWrite {signoff}'s next reply:"
+    )
+    try:
+        from pydantic_ai import Agent
+
+        from linkedin.llm import get_llm_model, run_agent_sync
+        agent = Agent(get_llm_model())
+        draft = run_agent_sync(agent.run(prompt)).output
+    except Exception as exc:
+        return JsonResponse({"error": ("AI draft failed: " + str(exc))[:300]}, status=502)
+    return JsonResponse({"text": (draft or "").strip()})
 
 
 @staff_member_required
