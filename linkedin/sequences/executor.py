@@ -377,11 +377,23 @@ def due_states_by_account(fallback_profile):
     return [(prof, states) for prof, states in groups.values()]
 
 
-def run_states(session, states) -> int:
+def run_states(session, states, on_step=None) -> int:
     """Advance a specific list of due states under *session*. Returns how many
     advanced; each state is claimed first and a step that raises is retried with
-    backoff (then parked STOPPED_ERROR), so one bad lead never halts the rest."""
-    return sum(1 for state in states if _run_one(session, state))
+    backoff (then parked STOPPED_ERROR), so one bad lead never halts the rest.
+
+    ``on_step`` (optional) is called between leads — the worker uses it to drain
+    a just-queued manual Unibox reply through this same open session, so a human
+    reply goes out in seconds instead of waiting for the whole batch. Called
+    bare: an AuthenticationError from the hook propagates like one from a step
+    (the caller auto-pauses the account)."""
+    ran = 0
+    for state in states:
+        if on_step is not None:
+            on_step()
+        if _run_one(session, state):
+            ran += 1
+    return ran
 
 
 def active_sending_accounts(fallback_profile):

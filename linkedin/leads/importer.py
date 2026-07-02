@@ -100,7 +100,7 @@ def _with_page(url: str, page: int) -> str:
 
 
 def scrape_search_url(session, url: str, cap: int = SEARCH_IMPORT_CAP,
-                      skip=None, start_page: int = 1) -> list[str]:
+                      skip=None, start_page: int = 1, abort_check=None) -> list[str]:
     """Return up to ``cap`` profile URLs from a people-search URL, paging through
     EVERY result page — the point is to categorically collect everyone, not just
     the first page-worth.
@@ -113,10 +113,14 @@ def scrape_search_url(session, url: str, cap: int = SEARCH_IMPORT_CAP,
       people instead of re-collecting them).
     - ``start_page``: begin here (a resumed scrape jumps near where it left off
       rather than re-walking from page 1 every pass).
+    - ``abort_check``: optional predicate polled between pages; truthy ends the
+      pass early with what's collected so far (the worker passes the manual-send
+      flag so a human's Unibox reply never waits behind a multi-minute scrape —
+      the list stays pending and the scrape resumes next cycle).
 
     Stops only at ``cap`` collected, a page with no URLs we haven't already seen
-    (the true end / LinkedIn's last-page clamp), or the ~100-page ceiling — NEVER
-    on a page that merely contained no *new-to-us* people.
+    (the true end / LinkedIn's last-page clamp), the ~100-page ceiling, or an
+    ``abort_check`` — NEVER on a page that merely contained no *new-to-us* people.
     """
     from linkedin_cli.browser.nav import extract_in_urls, goto_page
 
@@ -128,6 +132,8 @@ def scrape_search_url(session, url: str, cap: int = SEARCH_IMPORT_CAP,
     for page_num in range(max(1, start_page), SEARCH_MAX_PAGES + 1):
         if len(collected) >= cap:
             break
+        if abort_check is not None and abort_check():
+            break  # yield the browser — resume from here next pass
         page_url = _with_page(url, page_num)
         if page_num > max(1, start_page):  # human pause between pages — never a burst
             from linkedin.browser.session import random_sleep
@@ -152,7 +158,8 @@ def scrape_search_url(session, url: str, cap: int = SEARCH_IMPORT_CAP,
     return collected[:cap]
 
 
-def import_search_url(session, lead_list, url: str, cap: int = SEARCH_IMPORT_CAP) -> dict:
+def import_search_url(session, lead_list, url: str, cap: int = SEARCH_IMPORT_CAP,
+                      abort_check=None) -> dict:
     """Scrape a people-search URL and save EVERY person on it into ``lead_list``.
 
     Leads are created as skeleton rows (LinkedIn URL + public id) with NO
@@ -174,7 +181,8 @@ def import_search_url(session, lead_list, url: str, cap: int = SEARCH_IMPORT_CAP
     # if a prior pass stopped mid-page; scrape_search_url's skip=lead_exists dedupes
     # the small overlap.
     start_page = max(1, (lead_list.leads.count() // 10) - 1)
-    scraped = scrape_search_url(session, url, cap=cap, skip=lead_exists, start_page=start_page)
+    scraped = scrape_search_url(session, url, cap=cap, skip=lead_exists,
+                                start_page=start_page, abort_check=abort_check)
 
     created = 0
     for profile_url in scraped:
@@ -282,15 +290,21 @@ def backfill_lead_profiles(session, limit: int = 8) -> int:
     return done
 
 
-def process_pending_searches(session, cap: int = SEARCH_IMPORT_CAP) -> list:
+def process_pending_searches(session, cap: int = SEARCH_IMPORT_CAP, abort_check=None) -> list:
     """Scrape/AI-find any lead lists queued via the dashboard. Clears the
     ``pending_search`` flag whether or not it succeeds. Returns
     ``[(list_id, created), ...]``.
+
+    ``abort_check``: truthy ends the work early (lists stay pending and resume
+    next cycle) — the worker passes the manual-send flag so a human's reply
+    never waits behind a long scrape.
     """
     from linkedin.models import LeadList
 
     results = []
     for ll in LeadList.objects.filter(pending_search=True, archived_at__isnull=True):
+        if abort_check is not None and abort_check():
+            break  # list stays pending_search=True — resumes next cycle
         is_ai = ll.source_type == LeadList.SourceType.AI
         if is_ai:
             # The AI finder samples and is expensive — keep it target-bounded.
@@ -307,17 +321,20 @@ def process_pending_searches(session, cap: int = SEARCH_IMPORT_CAP) -> list:
             if is_ai:
                 created = import_ai_search(session, ll, ll.source_url or "", cap=this_pass).get("created", 0)
             else:
-                created = import_search_url(session, ll, ll.source_url or "", cap=this_pass).get("created", 0)
+                created = import_search_url(session, ll, ll.source_url or "", cap=this_pass,
+                                            abort_check=abort_check).get("created", 0)
             results.append((ll.pk, created))
         except Exception:
             logger.exception("Pending search failed for list %s", ll.pk)
             results.append((ll.pk, 0))
         # Keep going across cycles; stop when a pass adds nothing new (exhausted),
-        # or — for the AI finder — when its target_count is reached.
+        # or — for the AI finder — when its target_count is reached. An ABORTED
+        # pass proves nothing about exhaustion: stay pending and resume.
+        aborted = abort_check is not None and abort_check()
         ll.refresh_from_db(fields=["target_count"])
         if is_ai:
             ll.pending_search = bool(ll.leads.count() < (ll.target_count or 0) and created > 0)
         else:
-            ll.pending_search = created > 0
+            ll.pending_search = created > 0 or aborted
         ll.save(update_fields=["pending_search"])
     return results

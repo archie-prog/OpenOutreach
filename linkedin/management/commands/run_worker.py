@@ -29,7 +29,7 @@ class Command(BaseCommand):
         from linkedin.browser.registry import get_first_active_profile, get_or_create_session
         from pathlib import Path
 
-        from linkedin.inbox.poller import process_pending_sends, sync_inbox
+        from linkedin.inbox.poller import process_pending_sends, rebuild_threads, sync_inbox
         from linkedin.leads.importer import backfill_lead_profiles, process_pending_searches
         from linkedin.ml.lead_score import score_pending_leads
         from linkedin.models import LeadList, LinkedInProfile
@@ -175,7 +175,10 @@ class Command(BaseCommand):
                         s_session = get_or_create_session(fallback)
                         try:
                             acquire_session(fallback)
-                            searched = process_pending_searches(s_session, cap=30)
+                            # abort_check: a scrape pass yields the browser the moment a
+                            # manual Unibox reply is queued (lists stay pending + resume).
+                            searched = process_pending_searches(
+                                s_session, cap=30, abort_check=MANUAL_FLAG.exists)
                             if searched:
                                 extra += f" searches={searched}"
                         except AuthenticationError as exc:
@@ -289,13 +292,26 @@ class Command(BaseCommand):
                         acct_cooldown.pop(acct.pk, None)
                         did_send = False
                         if in_sess:
+                            # Between-lead hook: a manual Unibox reply queued for THIS
+                            # account goes out through this already-open session in
+                            # seconds, instead of waiting behind the whole batch. Same
+                            # browser, same identity — no new surface; other accounts'
+                            # replies are picked up by the instant flag block (the
+                            # sleep loop wakes within ~3s of the flag).
+                            drained = {"n": 0}
+
+                            def _drain_own(session=session, acct=acct, drained=drained):
+                                if MANUAL_FLAG.exists() and acct.auto_paused_at is None:
+                                    drained["n"] += process_pending_sends(session, account=acct)
+
                             try:
-                                ran_n = run_states(session, groups.get(acct.pk, []))
+                                ran_n = run_states(session, groups.get(acct.pk, []), on_step=_drain_own)
                                 executed += ran_n
                                 did_send = ran_n > 0
                                 ran.append(acct.linkedin_username)
                             except AuthenticationError as exc:
                                 auto_pause(acct, "LinkedIn 401 during sending (%s)" % exc)
+                            manual += drained["n"]
                         # Any account with an open session drains its OWN leftover
                         # manual sends (a second, self-healing path behind the instant
                         # .manual_send flag: whenever a non-default account is already
@@ -328,6 +344,14 @@ class Command(BaseCommand):
                             try:
                                 synced = sync_inbox(session)
                                 extra += f" synced[{acct.linkedin_username}]={synced}"
+                                if do_sync:
+                                    # Self-heal the mirror's long tail (threads not in
+                                    # the recent list / post-wipe) ONLY in the explicit
+                                    # sync slots — no new request pattern, and it goes
+                                    # quiet once every thread is populated.
+                                    rebuilt = rebuild_threads(session)
+                                    if rebuilt:
+                                        extra += f" rebuilt[{acct.linkedin_username}]={rebuilt}"
                                 if send_anchored:
                                     last_inbox = time.monotonic()  # keep the 300s floor
                             except AuthenticationError as exc:
@@ -335,6 +359,21 @@ class Command(BaseCommand):
                     finally:
                         # Close before the next account opens (strict serialize).
                         session.close_browser()
+
+                # Ownership invariant (each account has the RIGHT leads): an outbound
+                # message must belong to the account that owns its thread. DB-only,
+                # one COUNT per cycle; drift here would mean a reply went out from
+                # the wrong identity — scream, don't guess.
+                from django.db.models import F
+                from linkedin.models import Message as _Msg
+                drift = (_Msg.objects.filter(direction="out", sender_account__isnull=False)
+                         .exclude(sender_account=F("thread__account")).count())
+                if drift:
+                    extra += f" OWNERSHIP_DRIFT={drift}"
+                    logger.error(
+                        "OWNERSHIP DRIFT: %d outbound messages whose sender_account != "
+                        "thread.account — a reply may have gone out from the wrong "
+                        "LinkedIn identity; inspect before sending more", drift)
 
                 if sync_requested:
                     INBOX_FLAG.unlink(missing_ok=True)

@@ -63,16 +63,21 @@ class TestSearchImport:
         assert second["created"] == 0
         assert Lead.objects.filter(public_identifier__in=["alice", "bob"]).count() == 2
 
-    def test_cap_limits_enrichment(self, fake_session):
+    def test_cap_and_abort_flow_into_scrape_and_all_scraped_saved(self, fake_session):
+        # The cap bounds COLLECTION (inside scrape_search_url); everything scraped
+        # is saved as a skeleton lead — there is no per-profile enrichment at
+        # import time (backfill does that later, paced).
         from crm.models import Lead
         from linkedin.leads import importer
 
         ll = _new_list()
-        urls = list(PROFILES)  # 5 urls
-        with patch.object(importer, "scrape_search_url", return_value=urls), \
-                patch("linkedin_cli.api.client.PlaywrightLinkedinAPI") as MockAPI:
-            _mock_voyager(MockAPI)
-            result = importer.import_search_url(fake_session, ll, SEARCH_URL, cap=2)
+        sentinel = object()
+        with patch.object(importer, "scrape_search_url",
+                          return_value=list(PROFILES)[:2]) as mock_scrape:
+            result = importer.import_search_url(
+                fake_session, ll, SEARCH_URL, cap=2, abort_check=sentinel)
 
+        assert mock_scrape.call_args.kwargs["cap"] == 2
+        assert mock_scrape.call_args.kwargs["abort_check"] is sentinel
         assert result["created"] == 2
         assert Lead.objects.filter(lead_list=ll).count() == 2

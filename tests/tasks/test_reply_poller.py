@@ -1,10 +1,10 @@
 # tests/tasks/test_reply_poller.py
 """Reply detection — conversation-driven ``sync_inbox`` + fail-closed ``has_new_reply``.
 
-The lead-driven ``poll_replies`` + linkedin_cli navigation fallback were removed
-(they captured whatever thread was on screen and misattributed one lead's messages
-to others). ``sync_inbox`` matches the real conversation participant, so a message
-can only ever land in the owning thread.
+The mirror is keyed on LinkedIn's REAL message entityUrn, direction on the
+sender's URN, ordering on millisecond timestamps — so these tests feed raw
+Voyager-shaped payloads through the real ``parse_message_element`` parser
+(nothing about identity/direction is mocked away).
 """
 from __future__ import annotations
 
@@ -44,14 +44,25 @@ def _contacted_thread(fake_session, lead, conv_urn=""):
     )
 
 
-def _msg(text, minutes_ago=0, sender="Someone Else"):
-    ts = (timezone.now() - timedelta(minutes=minutes_ago)).strftime("%Y-%m-%d %H:%M")
-    return {"sender": sender, "text": text, "timestamp": ts}
+def _raw_msg(text, minutes_ago=0, sender_urn="urn:li:fsd_profile:LEAD1", msg_urn=None):
+    """One raw Voyager message element, as ``parse_message_element`` expects."""
+    ms = int((timezone.now() - timedelta(minutes=minutes_ago)).timestamp() * 1000)
+    return {
+        "entityUrn": msg_urn or f"urn:li:msg:m-{abs(hash((text, minutes_ago, sender_urn)))}",
+        "body": {"text": text},
+        "sender": {
+            "hostIdentityUrn": sender_urn,
+            "participantType": {"member": {
+                "firstName": {"text": "Some"}, "lastName": {"text": "One"},
+            }},
+        },
+        "deliveredAt": ms,
+    }
 
 
-def _run_sync(fake_session, lead, conv_urn, messages):
-    """Drive ``sync_inbox`` with the linkedin_cli boundary mocked. ``messages`` is
-    what ``parse_messages`` returns: ``[{sender, text, timestamp}]``."""
+def _run_sync(fake_session, lead, conv_urn, raw_messages):
+    """Drive ``sync_inbox`` with the linkedin_cli API boundary mocked at the
+    RAW-payload level — the real parser decides identity and direction."""
     from linkedin.inbox import poller
 
     convs = {"data": {"messengerConversationsBySyncToken": {"elements": [
@@ -60,10 +71,10 @@ def _run_sync(fake_session, lead, conv_urn, messages):
             {"hostIdentityUrn": lead.urn},
         ]},
     ]}}}
+    msgs = {"data": {"messengerMessagesBySyncToken": {"elements": raw_messages}}}
     with patch("linkedin_cli.api.client.PlaywrightLinkedinAPI", return_value=object()), \
          patch("linkedin_cli.api.messaging.fetch_conversations", return_value=convs), \
-         patch("linkedin_cli.api.messaging.fetch_messages", return_value={}), \
-         patch("linkedin_cli.actions.conversations.parse_messages", return_value=messages), \
+         patch("linkedin_cli.api.messaging.fetch_messages", return_value=msgs), \
          patch("linkedin.notify.slack.notify_reply"):
         return poller.sync_inbox(fake_session)
 
@@ -76,23 +87,29 @@ class TestSyncInboxReplyStop:
         lead = _lead()
         state = _state(fake_session, lead)
         _contacted_thread(fake_session, lead, "urn:li:msg:CONV1")
-        _run_sync(fake_session, lead, "urn:li:msg:CONV1", [_msg("thanks!", minutes_ago=1)])
+        _run_sync(fake_session, lead, "urn:li:msg:CONV1", [_raw_msg("thanks!", minutes_ago=1)])
 
         state.refresh_from_db()
         assert state.state == LeadCampaignState.State.STOPPED_REPLY
         assert Message.objects.filter(direction="in").count() == 1
+        # identity is LinkedIn's own, not a synthetic hash
+        assert Message.objects.get(direction="in").linkedin_message_id.startswith("urn:li:msg:")
 
     def test_outbound_only_does_not_stop(self, fake_session):
-        from linkedin.models import LeadCampaignState
+        # Direction comes from the sender URN — our own messages (mailbox urn)
+        # must never read as inbound, whatever the display name says.
+        from linkedin.models import LeadCampaignState, Message
 
         lead = _lead()
         state = _state(fake_session, lead)
         _contacted_thread(fake_session, lead, "urn:li:msg:CONV1")
         _run_sync(fake_session, lead, "urn:li:msg:CONV1",
-                  [_msg("hi", minutes_ago=1, sender="Diego Ramirez")])
+                  [_raw_msg("hi", minutes_ago=1, sender_urn=fake_session.self_profile["urn"])])
 
         state.refresh_from_db()
         assert state.state == LeadCampaignState.State.ACTIVE
+        assert Message.objects.filter(direction="out").count() == 1
+        assert Message.objects.filter(direction="in").count() == 0
 
     def test_reply_older_than_last_action_ignored(self, fake_session):
         from linkedin.models import LeadCampaignState
@@ -100,18 +117,20 @@ class TestSyncInboxReplyStop:
         lead = _lead()
         state = _state(fake_session, lead, last_action_minutes_ago=0)
         _contacted_thread(fake_session, lead, "urn:li:msg:CONV1")
-        _run_sync(fake_session, lead, "urn:li:msg:CONV1", [_msg("earlier", minutes_ago=120)])
+        _run_sync(fake_session, lead, "urn:li:msg:CONV1", [_raw_msg("earlier", minutes_ago=120)])
 
         state.refresh_from_db()
         assert state.state == LeadCampaignState.State.ACTIVE
 
     def test_idempotent_no_duplicate_messages(self, fake_session):
+        # The mirror is keyed on the real message URN — syncing the same
+        # conversation twice cannot duplicate a row.
         from linkedin.models import Message
 
         lead = _lead()
         _state(fake_session, lead)
         _contacted_thread(fake_session, lead, "urn:li:msg:CONV1")
-        msgs = [_msg("hi", minutes_ago=1)]
+        msgs = [_raw_msg("hi", minutes_ago=1, msg_urn="urn:li:msg:FIXED1")]
         _run_sync(fake_session, lead, "urn:li:msg:CONV1", msgs)
         _run_sync(fake_session, lead, "urn:li:msg:CONV1", msgs)
 
@@ -124,14 +143,17 @@ class TestSyncInboxReplyStop:
 
         lead = _lead()
         state = _state(fake_session, lead)
-        updated = _run_sync(fake_session, lead, "urn:li:msg:CONV1", [_msg("thanks!", minutes_ago=1)])
+        updated = _run_sync(fake_session, lead, "urn:li:msg:CONV1", [_raw_msg("thanks!", minutes_ago=1)])
 
         state.refresh_from_db()
         assert state.state == LeadCampaignState.State.ACTIVE
         assert Message.objects.count() == 0
         assert updated == 0
 
-    def test_manual_send_rekeyed_not_duplicated(self, fake_session):
+    def test_real_row_replaces_manual_outbox_twin(self, fake_session):
+        # A manual Unibox reply is queued with a placeholder id and sent by the
+        # worker; when LinkedIn returns the REAL message, the real row replaces
+        # the outbox twin — one message, LinkedIn's identity.
         from linkedin.models import Message
 
         lead = _lead()
@@ -139,40 +161,35 @@ class TestSyncInboxReplyStop:
         thread = _contacted_thread(fake_session, lead, "urn:li:msg:CONV1")
         Message.objects.create(
             thread=thread, direction="out", body="my reply", sent_via_tool=True,
-            linkedin_message_id="manual-abc",
+            linkedin_message_id="manual-abc", pending_send=False,
         )
         _run_sync(fake_session, lead, "urn:li:msg:CONV1",
-                  [_msg("my reply", minutes_ago=1, sender="Diego Ramirez")])
+                  [_raw_msg("my reply", minutes_ago=1,
+                            sender_urn=fake_session.self_profile["urn"])])
 
-        assert Message.objects.filter(thread=thread, direction="out").count() == 1
+        out = Message.objects.filter(thread=thread, direction="out")
+        assert out.count() == 1
+        assert out.get().linkedin_message_id.startswith("urn:li:msg:")
         assert not Message.objects.filter(linkedin_message_id="manual-abc").exists()
 
-    def test_rekey_skipped_when_synth_already_exists(self, fake_session):
-        # Legacy data: a thread already holds BOTH a manual- row and its synth twin.
-        # Re-keying would hit the (thread, id) unique constraint — it must be skipped,
-        # not crash the sync. Exercise the ingest path directly (no wrapper to mask).
-        from linkedin.inbox import poller
+    def test_pending_outbox_row_is_not_replaced(self, fake_session):
+        # A reply still QUEUED (pending_send=True) hasn't reached LinkedIn — a
+        # coincidental same-body outbound from the mirror must not delete it.
         from linkedin.models import Message
 
         lead = _lead()
         _state(fake_session, lead)
         thread = _contacted_thread(fake_session, lead, "urn:li:msg:CONV1")
-        msg = _msg("dup reply", minutes_ago=1, sender="Diego Ramirez")
-        synth = poller._synth_id("Diego Ramirez", "dup reply", msg["timestamp"])
-        Message.objects.create(thread=thread, direction="out", body="dup reply",
-                               sent_via_tool=True, linkedin_message_id="manual-xyz")
-        Message.objects.create(thread=thread, direction="out", body="dup reply",
-                               linkedin_message_id=synth)
-        conv = {"entityUrn": "urn:li:msg:CONV1", "conversationParticipants": [
-            {"hostIdentityUrn": fake_session.self_profile["urn"]},
-            {"hostIdentityUrn": lead.urn}]}
-        with patch("linkedin_cli.api.messaging.fetch_messages", return_value={}), \
-             patch("linkedin_cli.actions.conversations.parse_messages", return_value=[msg]):
-            poller._ingest_conversation(
-                fake_session, object(), fake_session.linkedin_profile,
-                fake_session.self_profile["urn"], conv)
+        Message.objects.create(
+            thread=thread, direction="out", body="my reply", sent_via_tool=True,
+            linkedin_message_id="manual-queued", pending_send=True,
+        )
+        _run_sync(fake_session, lead, "urn:li:msg:CONV1",
+                  [_raw_msg("my reply", minutes_ago=1,
+                            sender_urn=fake_session.self_profile["urn"])])
 
-        assert Message.objects.filter(thread=thread, direction="out").count() == 2
+        assert Message.objects.filter(linkedin_message_id="manual-queued",
+                                      pending_send=True).exists()
 
 
 @pytest.mark.django_db

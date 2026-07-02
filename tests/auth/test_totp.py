@@ -105,7 +105,7 @@ class _FakePage:
         # typed text under its selector so the credential assertions still hold.
         return _FakeLocator(self, selector)
 
-    def get_by_role(self, role, name=None):
+    def get_by_role(self, role, name=None, exact=False):
         if role == "button":
             return _FakeLocator(self, name or "button")
         if role == "checkbox":
@@ -141,8 +141,10 @@ class TestLoginWithTotp:
         page = _FakePage(after_signin=CHALLENGE, after_submit=[FEED])
         login_with_totp(_FakeSession(page), "user@example.com", "pw", RFC_SECRET)
 
-        assert ("#username", "user@example.com") in page.filled
-        assert ("#password", "pw") in page.filled
+        # The login flow locates fields via a combined selector chain (#username
+        # OR the React form aliases) — match on the chain head, not equality.
+        assert any(sel.startswith("#username") and v == "user@example.com" for sel, v in page.filled)
+        assert any(sel.startswith("#password") and v == "pw" for sel, v in page.filled)
         # A 6-digit code was filled on the challenge page, and we ended on the feed.
         assert any(isinstance(v, str) and v.isdigit() and len(v) == 6 for _, v in page.filled)
         assert "/feed" in page.url
