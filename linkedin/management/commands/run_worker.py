@@ -218,7 +218,27 @@ class Command(BaseCommand):
                             logger.warning("Manual send for %s skipped: %s", acct_m.linkedin_username, exc)
                         finally:
                             m_session.close_browser()  # serialize: close before the loop opens any
-                    MANUAL_FLAG.unlink(missing_ok=True)
+                    # Clear the wake-signal only once nothing DELIVERABLE is still
+                    # queued. If an account was skipped this pass for a transient
+                    # reason (browser acquire failed, in-memory cooldown, or the
+                    # worker restarted mid-drain), leave the flag so the next cycle
+                    # retries — unlinking unconditionally stranded a non-default
+                    # account's manual replies FOREVER (this block is their only
+                    # drain path). A message whose owner is paused/credless can't be
+                    # sent now, so it doesn't keep the signal armed (it goes once the
+                    # account recovers and the next manual send re-arms the flag).
+                    # MAX_MANUAL_SEND_ATTEMPTS still bounds a permanently-failing send.
+                    deliverable = any(
+                        (m.sender_account or m.thread.account) is not None
+                        and (m.sender_account or m.thread.account).auto_paused_at is None
+                        and ((m.sender_account or m.thread.account).cookie_data
+                             or (m.sender_account or m.thread.account).totp_secret
+                             or (m.sender_account or m.thread.account).password_login_ok)
+                        for m in Message.objects.filter(pending_send=True)
+                        .select_related("sender_account", "thread__account")
+                    )
+                    if not deliverable:
+                        MANUAL_FLAG.unlink(missing_ok=True)
 
                 # Serialize browsers: Playwright's sync API allows only ONE live
                 # instance per OS thread, and concurrent sessions from one IP are a
@@ -276,14 +296,19 @@ class Command(BaseCommand):
                                 ran.append(acct.linkedin_username)
                             except AuthenticationError as exc:
                                 auto_pause(acct, "LinkedIn 401 during sending (%s)" % exc)
-                        # Default account drains any leftover manual sends (backstop to
-                        # the instant .manual_send path; scoped to its own pending) and
-                        # runs heavy enrichment, inside its own open window.
-                        if is_default and in_sess and acct.auto_paused_at is None:
+                        # Any account with an open session drains its OWN leftover
+                        # manual sends (a second, self-healing path behind the instant
+                        # .manual_send flag: whenever a non-default account is already
+                        # open for its due sequence steps, flush its queued replies too
+                        # — so a dropped/missed flag can't strand them). Scoped per
+                        # account, so a session only ever types into its own inbox.
+                        if acct.auto_paused_at is None:
                             try:
                                 manual += process_pending_sends(session, account=acct)
                             except AuthenticationError as exc:
                                 auto_pause(acct, "LinkedIn 401 during manual send (%s)" % exc)
+                        # The default account also runs heavy enrichment in its window.
+                        if is_default and in_sess and acct.auto_paused_at is None:
                             if heavy_due and acct.auto_paused_at is None:
                                 try:
                                     backfilled = backfill_lead_profiles(session, limit=8)
