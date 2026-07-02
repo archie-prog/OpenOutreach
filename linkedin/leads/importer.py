@@ -18,6 +18,8 @@ logger = logging.getLogger(__name__)
 
 # LinkedIn People search exposes ~100 pages of ~10 results; 1000 is the ceiling.
 SEARCH_IMPORT_CAP = 1000
+# LinkedIn stops serving results past ~100 pages — never page beyond this.
+SEARCH_MAX_PAGES = 100
 
 CSV_REQUIRED_COLUMN = "linkedin_url"
 
@@ -97,23 +99,37 @@ def _with_page(url: str, page: int) -> str:
     return urlunparse(parts._replace(query=urlencode(query, doseq=True)))
 
 
-def scrape_search_url(session, url: str, cap: int = SEARCH_IMPORT_CAP) -> list[str]:
-    """Return up to ``cap`` unique profile URLs from a people-search URL.
+def scrape_search_url(session, url: str, cap: int = SEARCH_IMPORT_CAP,
+                      skip=None, start_page: int = 1) -> list[str]:
+    """Return up to ``cap`` profile URLs from a people-search URL, paging through
+    EVERY result page — the point is to categorically collect everyone, not just
+    the first page-worth.
 
-    Paginates via the ``page`` query parameter, reusing ``linkedin_cli``'s
-    page navigation and ``/in/`` extraction. Stops when a page yields no new
-    URLs or the cap is reached.
+    Paginates via the ``page`` query parameter, reusing ``linkedin_cli``'s page
+    navigation and ``/in/`` extraction.
+
+    - ``skip``: optional predicate; URLs it returns truthy for are paged PAST but
+      not collected (pass ``lead_exists`` so a resumed scrape skips already-imported
+      people instead of re-collecting them).
+    - ``start_page``: begin here (a resumed scrape jumps near where it left off
+      rather than re-walking from page 1 every pass).
+
+    Stops only at ``cap`` collected, a page with no URLs we haven't already seen
+    (the true end / LinkedIn's last-page clamp), or the ~100-page ceiling — NEVER
+    on a page that merely contained no *new-to-us* people.
     """
     from linkedin_cli.browser.nav import extract_in_urls, goto_page
 
+    skip = skip or (lambda u: False)
     session.ensure_browser()
     expected = urlparse(url).path.rstrip("/") or "/"
     collected: list[str] = []
     seen: set[str] = set()
-    page_num = 1
-    while len(collected) < cap:
+    for page_num in range(max(1, start_page), SEARCH_MAX_PAGES + 1):
+        if len(collected) >= cap:
+            break
         page_url = _with_page(url, page_num)
-        if page_num > 1:  # human pause between result pages — never a rapid scrape burst
+        if page_num > max(1, start_page):  # human pause between pages — never a burst
             from linkedin.browser.session import random_sleep
             random_sleep(6, 12)
         goto_page(
@@ -122,52 +138,65 @@ def scrape_search_url(session, url: str, cap: int = SEARCH_IMPORT_CAP) -> list[s
             expected_url_pattern=expected,
             error_message="Failed to reach search results",
         )
-        fresh = [u for u in extract_in_urls(session.page) if u not in seen]
-        if not fresh:
-            break
-        for u in fresh:
+        new_on_page = [u for u in extract_in_urls(session.page) if u not in seen]
+        if not new_on_page:
+            break  # nothing we haven't already seen on this page = past the last result
+        for u in new_on_page:
             seen.add(u)
+            if skip(u):
+                continue  # already imported — page past it, keep looking for new people
             collected.append(u)
             if len(collected) >= cap:
                 break
-        page_num += 1
 
     return collected[:cap]
 
 
 def import_search_url(session, lead_list, url: str, cap: int = SEARCH_IMPORT_CAP) -> dict:
-    """Scrape a people-search URL and enrich up to ``cap`` new leads into
-    ``lead_list``. Idempotent: re-running the same URL skips existing leads.
+    """Scrape a people-search URL and save EVERY person on it into ``lead_list``.
+
+    Leads are created as skeleton rows (LinkedIn URL + public id) with NO
+    per-profile Voyager fetch during the scrape — so a large search is captured
+    quickly and with a light footprint (listing result pages, not opening every
+    profile). Name/title/company are filled in afterwards by the background
+    enrichment pass (``backfill_lead_profiles``), which paces the expensive
+    per-profile calls and keeps the account safe.
+
+    Idempotent + resumable: already-imported people are skipped and the scrape
+    resumes near where the last pass stopped, so repeated paced passes march
+    through the entire search rather than re-collecting the first page every time.
     Returns ``{"created", "scraped"}``.
     """
-    from linkedin.db.leads import create_enriched_lead, lead_exists
-    from linkedin_cli.api.client import PlaywrightLinkedinAPI
+    from crm.models import Lead
+    from linkedin.db.leads import lead_exists
 
-    scraped = scrape_search_url(session, url, cap=cap)
-    new_urls = [u for u in scraped if not lead_exists(u)][:cap]
+    # Resume ~1 page behind where we left off (10 results/page) so no one is missed
+    # if a prior pass stopped mid-page; scrape_search_url's skip=lead_exists dedupes
+    # the small overlap.
+    start_page = max(1, (lead_list.leads.count() // 10) - 1)
+    scraped = scrape_search_url(session, url, cap=cap, skip=lead_exists, start_page=start_page)
 
-    session.ensure_browser()
-    api = PlaywrightLinkedinAPI(session=session)
     created = 0
-    for profile_url in new_urls:
-        try:
-            profile, _raw = api.get_profile(profile_url=profile_url)
-        except Exception:
-            logger.warning("Voyager failed for %s — skipping", profile_url)
+    for profile_url in scraped:
+        public_id = url_to_public_id(profile_url)
+        if not public_id or Lead.objects.filter(public_identifier=public_id).exists():
             continue
-        if not profile:
-            continue
-        if create_enriched_lead(session, profile_url, profile, lead_list=lead_list) is not None:
-            created += 1
+        Lead.objects.create(
+            linkedin_url=public_id_to_url(public_id),
+            public_identifier=public_id,
+            lead_list=lead_list,
+        )
+        created += 1
 
     logger.info(
-        "Search import into %s: created=%d (scraped=%d)", lead_list, created, len(scraped),
+        "Search import into %s: created=%d skeleton leads (scraped=%d)",
+        lead_list, created, len(scraped),
     )
     log_event(
         lead_list, "system",
-        f"Scraped the saved LinkedIn search ({len(scraped)} profiles) and added "
-        f"{created} new lead{'s' if created != 1 else ''} "
-        f"({lead_list.leads.count()} in the list so far).",
+        f"Scraped the saved LinkedIn search and added {created} new "
+        f"lead{'s' if created != 1 else ''} ({lead_list.leads.count()} in the list so "
+        f"far). Profile details fill in automatically as enrichment runs.",
         created=created, scraped=len(scraped),
     )
     return {"created": created, "scraped": len(scraped)}
@@ -262,12 +291,20 @@ def process_pending_searches(session, cap: int = SEARCH_IMPORT_CAP) -> list:
 
     results = []
     for ll in LeadList.objects.filter(pending_search=True, archived_at__isnull=True):
-        target = ll.target_count or 30
-        remaining = max(0, target - ll.leads.count())
-        this_pass = min(cap, remaining) or cap
+        is_ai = ll.source_type == LeadList.SourceType.AI
+        if is_ai:
+            # The AI finder samples and is expensive — keep it target-bounded.
+            target = ll.target_count or 30
+            remaining = max(0, target - ll.leads.count())
+            this_pass = min(cap, remaining) or cap
+        else:
+            # A real search URL is imported EXHAUSTIVELY: grab up to `cap` new people
+            # this pass and stay pending until a pass adds nothing new. target_count
+            # is NOT a cap here — that was why URL lists stopped at ~30.
+            this_pass = cap
         created = 0
         try:
-            if ll.source_type == LeadList.SourceType.AI:
+            if is_ai:
                 created = import_ai_search(session, ll, ll.source_url or "", cap=this_pass).get("created", 0)
             else:
                 created = import_search_url(session, ll, ll.source_url or "", cap=this_pass).get("created", 0)
@@ -275,9 +312,12 @@ def process_pending_searches(session, cap: int = SEARCH_IMPORT_CAP) -> list:
         except Exception:
             logger.exception("Pending search failed for list %s", ll.pk)
             results.append((ll.pk, 0))
-        # Keep filling toward the target across cycles; stop when reached or when
-        # a pass adds nothing new (the search is exhausted).
+        # Keep going across cycles; stop when a pass adds nothing new (exhausted),
+        # or — for the AI finder — when its target_count is reached.
         ll.refresh_from_db(fields=["target_count"])
-        ll.pending_search = bool(ll.leads.count() < (ll.target_count or 0) and created > 0)
+        if is_ai:
+            ll.pending_search = bool(ll.leads.count() < (ll.target_count or 0) and created > 0)
+        else:
+            ll.pending_search = created > 0
         ll.save(update_fields=["pending_search"])
     return results
