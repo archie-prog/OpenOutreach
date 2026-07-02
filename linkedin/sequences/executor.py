@@ -42,7 +42,7 @@ class MessageSendError(Exception):
 # logged but not enforced, so a drifted selector can't wrongly park real leads
 # before we've confirmed the check matches reality. Flip to True to enforce once
 # the logs show it tracking real sends.
-_ENFORCE_SEND_VERIFY = False
+_ENFORCE_SEND_VERIFY = True
 
 # Total times a step is attempted before the lead is parked as STOPPED_ERROR. So
 # a transient Playwright timeout / nav hiccup no longer permanently bricks a lead
