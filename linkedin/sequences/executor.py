@@ -27,6 +27,23 @@ logger = logging.getLogger(__name__)
 DEFAULT_CONNECT_DECISION_DAYS = 14
 Branch = SequenceStep.Branch
 
+
+class MessageSendError(Exception):
+    """A message step could not be confirmed as sent. Raised so the step is
+    retried with backoff via _record_step_failure and, crucially, so the caller
+    never reaches _log(MESSAGE) — no phantom 'sent' is recorded for a send that
+    did not actually leave the browser."""
+
+
+# Delivery verification for message steps. `send_raw_message` returns False only
+# when BOTH the browser flow and the API fallback threw — a definite non-send,
+# always enforced. The *positive* check (did our text actually post to the thread)
+# depends on live-LinkedIn selectors, so it ships in OBSERVE mode: the verdict is
+# logged but not enforced, so a drifted selector can't wrongly park real leads
+# before we've confirmed the check matches reality. Flip to True to enforce once
+# the logs show it tracking real sends.
+_ENFORCE_SEND_VERIFY = False
+
 # Total times a step is attempted before the lead is parked as STOPPED_ERROR. So
 # a transient Playwright timeout / nav hiccup no longer permanently bricks a lead
 # (the old code went terminal on the first exception), while a genuinely broken
@@ -823,6 +840,44 @@ def is_connection_accepted(session, state) -> bool:
     return connection_status(session, state) == str(ProfileState.CONNECTED)
 
 
+def _verify_message_sent(session, body) -> bool:
+    """Best-effort confirmation that ``body`` actually posted to the open thread.
+
+    LinkedIn empties the compose box on a real send; if our text is still sitting
+    in it, the click did not submit (a silent no-op — e.g. the send button was
+    disabled, the recipient never resolved on the new-thread flow, or the account
+    is restricted). We only declare FAILED when we can positively see our text
+    still in the box, so the check errs toward not blocking real sends. Returns
+    True (confirmed / inconclusive-but-not-contradicted) or False (positively not
+    sent). Always logs its verdict.
+    """
+    snippet = (body or "").strip()
+    try:
+        from linkedin_cli.actions.message import _find
+
+        try:
+            box = _find(session.page, "compose_input", timeout=2000).first
+            remaining = (box.inner_text() or "").strip()
+        except Exception:
+            logger.warning("SEND VERIFY inconclusive — compose box not found after send")
+            return True  # can't read it (API-fallback send / navigated) — don't contradict
+        if snippet and snippet[:80] in remaining:
+            logger.warning(
+                "SEND VERIFY FAILED — text still in the compose box, the message did NOT "
+                "post (recipient unresolved / not connected / restricted?) snippet=%r",
+                snippet[:60],
+            )
+            return False
+        # WARNING-level on purpose during the OBSERVE window so the positive case is
+        # visible even with INFO suppressed — lets us confirm the check tracks real
+        # sends before enforcing. Drop to info once _ENFORCE_SEND_VERIFY is on.
+        logger.warning("SEND VERIFY ok — compose cleared after send (observe)")
+        return True
+    except Exception:
+        logger.warning("SEND VERIFY errored — treating as inconclusive", exc_info=True)
+        return True
+
+
 def send_message(session, state, step):
     from linkedin_cli.actions.message import send_raw_message
 
@@ -834,7 +889,15 @@ def send_message(session, state, step):
     )
     urn = lead.urn or lead.get_urn(session)
     pdict = {"public_identifier": lead.public_identifier, "url": lead.linkedin_url, "urn": urn}
-    send_raw_message(session, pdict, body)
+    ok = send_raw_message(session, pdict, body)
+    if not ok:
+        # Both the browser flow and the API fallback failed — a definite non-send.
+        # Raise so the step retries with backoff instead of the caller logging a
+        # phantom MESSAGE (it only reaches _log() when this returns normally).
+        raise MessageSendError(f"send_raw_message reported failure for lead {lead.pk}")
+    # Confirm it actually landed. OBSERVE-mode by default (logs, does not park).
+    if not _verify_message_sent(session, body) and _ENFORCE_SEND_VERIFY:
+        raise MessageSendError(f"message send to lead {lead.pk} could not be verified as posted")
 
 
 def send_inmail(session, state, step):
