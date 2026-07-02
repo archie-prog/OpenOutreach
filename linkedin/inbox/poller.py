@@ -250,11 +250,17 @@ def rebuild_threads(session, limit=6) -> int:
     api = PlaywrightLinkedinAPI(session=session)
     rebuilt = 0
     for i, thread in enumerate(empties):
+        if not thread.lead.urn or thread.lead.urn == mailbox_urn:
+            # Self-lead (the account owner exists as a Lead row) or URN-less lead:
+            # a participant search keyed on the MAILBOX urn matches EVERY
+            # conversation, so it would attach someone else's thread here (the
+            # audit's thread-1345 misattachment). Stamp + skip forever.
+            thread.last_polled_at = timezone.now()
+            thread.save(update_fields=["last_polled_at"])
+            continue
         if i:
             random_sleep(4, 9)  # human pause — a rebuild is reads, but never a burst
-        conv_urn = thread.linkedin_thread_id or (
-            find_conversation_urn(api, thread.lead.urn, mailbox_urn) if thread.lead.urn else ""
-        )
+        conv_urn = thread.linkedin_thread_id or find_conversation_urn(api, thread.lead.urn, mailbox_urn)
         if conv_urn:
             if not thread.linkedin_thread_id:
                 thread.linkedin_thread_id = conv_urn
